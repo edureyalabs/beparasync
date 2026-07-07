@@ -100,7 +100,7 @@ def write_execution_log(run_id: str, stdout: str, stderr: str, exit_code: int, d
         "stderr":      stderr,
         "exit_code":   exit_code,
         "duration_ms": duration_ms,
-    }).execute()
+    }, on_conflict="run_id").execute()
 
 
 def build_tool_definitions(tools: list[dict]) -> list[dict]:
