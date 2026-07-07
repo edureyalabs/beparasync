@@ -1,6 +1,6 @@
-# requirements.txt
 fastapi
 uvicorn[standard]
 supabase
 python-dotenv
 httpx
+python-multipart
