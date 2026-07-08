@@ -1,4 +1,4 @@
-# executor.py
+# beparasync/executor.py
 import asyncio
 import json
 import os
@@ -11,38 +11,31 @@ from typing import Any
 from db import supabase
 
 
-
 PY_TYPE_MAP = {
     "string": "str", "number": "float", "integer": "int",
     "boolean": "bool", "array": "list", "object": "dict",
 }
 
+
 def build_full_code(tool_name: str, parameters: dict, body: str) -> str:
-    """
-    Builds a complete Python function from tool_name, parameters schema, and body.
-    The editor stores only the body — this reconstructs the full def at runtime.
-    """
-    import textwrap as _tw
     props = parameters.get("properties", {})
     args  = [
         f"{name}: {PY_TYPE_MAP.get(meta.get('type', 'string'), 'str')}"
         for name, meta in props.items()
     ]
     signature = f"def {tool_name}({', '.join(args)}):"
-    indented  = _tw.indent(body.strip(), "    ")
+    indented  = textwrap.indent(body.strip(), "    ")
     return f"{signature}\n{indented}"
 
 
 async def fetch_secrets(toolset_id: str) -> dict[str, str]:
-    """
-    Calls the SECURITY DEFINER RPC to get decrypted secrets for a toolset.
-    Only works with the service role key — never callable from the frontend.
-    """
     response = supabase.rpc("get_toolset_secrets", {"p_toolset_id": toolset_id}).execute()
-    secrets: dict[str, str] = {}
-    for row in response.data or []:
-        secrets[row["key_name"]] = row["secret_value"]
-    return secrets
+    return {row["key_name"]: row["secret_value"] for row in response.data or []}
+
+
+async def fetch_agent_secrets(agent_id: str) -> dict[str, str]:
+    response = supabase.rpc("get_agent_secrets", {"p_agent_id": agent_id}).execute()
+    return {row["key_name"]: row["secret_value"] for row in response.data or []}
 
 
 def _run_subprocess(
@@ -52,11 +45,6 @@ def _run_subprocess(
     secrets: dict[str, str],
     timeout: int,
 ) -> dict[str, Any]:
-    """
-    Receives fully-formed code (def + body) from the frontend.
-    Runs it in a subprocess with secrets injected as env vars.
-    Works on Windows, Linux, and macOS.
-    """
     runner = textwrap.dedent("""
         import sys, json, os, traceback
 
@@ -84,12 +72,7 @@ def _run_subprocess(
             print(json.dumps({"ok": False, "error": str(e), "traceback": traceback.format_exc()}))
     """)
 
-    payload = json.dumps({
-        "code": code,
-        "fn_name": tool_name,
-        "arguments": arguments,
-    })
-
+    payload = json.dumps({"code": code, "fn_name": tool_name, "arguments": arguments})
     env = {**os.environ, **secrets}
 
     try:
@@ -100,29 +83,14 @@ def _run_subprocess(
             timeout=timeout,
             env=env,
         )
-
         raw = proc.stdout.decode().strip()
         if not raw:
-            return {
-                "ok": False,
-                "error": proc.stderr.decode().strip() or "Tool produced no output.",
-                "traceback": None,
-            }
-
+            return {"ok": False, "error": proc.stderr.decode().strip() or "Tool produced no output.", "traceback": None}
         return json.loads(raw)
-
     except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "error": f"Tool execution timed out after {timeout}s.",
-            "traceback": None,
-        }
+        return {"ok": False, "error": f"Tool execution timed out after {timeout}s.", "traceback": None}
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"Executor error: {e}",
-            "traceback": traceback.format_exc(),
-        }
+        return {"ok": False, "error": f"Executor error: {e}", "traceback": traceback.format_exc()}
 
 
 async def run_tool(
@@ -133,16 +101,7 @@ async def run_tool(
     parameters: dict[str, Any] = {},
     timeout: int = 30,
 ) -> dict[str, Any]:
-    """
-    Runs the blocking subprocess in a thread pool so FastAPI stays non-blocking.
-    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        None,
-        _run_subprocess,
-        code,
-        tool_name,
-        arguments,
-        secrets,
-        timeout,
+        None, _run_subprocess, code, tool_name, arguments, secrets, timeout,
     )

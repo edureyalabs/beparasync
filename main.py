@@ -1,5 +1,4 @@
 # beparasync/main.py
-
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -9,10 +8,11 @@ from routes.tools        import router as tools_router
 from routes.agents       import router as agents_router
 from routes.files        import router as files_router
 from routes.environments import router as environments_router
+from routes.agent_config import router as agent_config_router
 
 load_dotenv()
 
-app = FastAPI(title="parasync backend", version="0.2.0")
+app = FastAPI(title="parasync backend", version="0.3.0")
 
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
 origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -29,6 +29,7 @@ app.include_router(tools_router)
 app.include_router(agents_router)
 app.include_router(files_router)
 app.include_router(environments_router)
+app.include_router(agent_config_router)
 
 
 @app.get("/health")

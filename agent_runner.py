@@ -1,12 +1,11 @@
 # beparasync/agent_runner.py
-
 import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any
 
 from db import supabase
-from executor import fetch_secrets, run_tool, build_full_code
+from executor import fetch_secrets, fetch_agent_secrets, run_tool, build_full_code
 from llm.factory import get_llm_client
 from sandbox_client import run_in_sandbox
 
@@ -50,7 +49,6 @@ def load_tools(agent_id: str) -> list[dict]:
     toolset_ids = [row["toolset_id"] for row in (res.data or [])]
     if not toolset_ids:
         return []
-
     tools_res = (
         supabase.from_("tools")
         .select("*")
@@ -80,9 +78,18 @@ def load_environment(agent_id: str) -> dict:
     return res.data[0] if res.data else {}
 
 
+def load_agent_platform_tools(agent_id: str) -> set[str]:
+    res = (
+        supabase.from_("agent_platform_tools")
+        .select("platform_tool_key")
+        .eq("agent_id", agent_id)
+        .execute()
+    )
+    return {row["platform_tool_key"] for row in (res.data or [])}
+
+
 def fetch_file_from_storage(storage_path: str) -> bytes:
-    result = supabase.storage.from_("agent-files").download(storage_path)
-    return result
+    return supabase.storage.from_("agent-files").download(storage_path)
 
 
 def push_file_to_storage(storage_path: str, content: bytes, mime_type: str = "application/octet-stream"):
@@ -110,8 +117,9 @@ def build_tool_definitions(tools: list[dict]) -> list[dict]:
     ]
 
 
-def build_system_prompt(agent: dict, contexts: list[dict]) -> str:
+def build_system_prompt(agent: dict, contexts: list[dict], agent_secret_keys: list[str]) -> str:
     parts = [agent["system_prompt"].strip()]
+
     if contexts:
         parts.append("\n\n---\n## Context\n")
         for ctx in contexts:
@@ -119,20 +127,27 @@ def build_system_prompt(agent: dict, contexts: list[dict]) -> str:
             if ctx.get("description"):
                 parts.append(f"_{ctx['description']}_")
             parts.append(ctx["content"])
+
+    if agent_secret_keys:
+        parts.append("\n\n---\n## Available environment variables")
+        parts.append(
+            "The following secrets are injected into your sandbox as environment variables. "
+            "Access them in code with `os.environ['KEY_NAME']`:"
+        )
+        for key in agent_secret_keys:
+            parts.append(f"- `{key}`")
+
     return "\n".join(parts)
 
-
-# ─── Sandbox tool: execute_code ───────────────────────────────────────────────
-# A built-in tool the LLM can call to run code in the sandbox.
-# It is injected into the tool list automatically — agents don't need to define it.
 
 SANDBOX_TOOL_DEF = {
     "name": "execute_code",
     "description": (
         "Execute Python code in a secure sandbox. "
-        "The code runs in an isolated container with access to the task's workspace files. "
-        "Use this for computation, file processing, data analysis, or any task requiring code execution. "
-        "Returns stdout output. Write results to files if you need to persist them."
+        "The code runs in an isolated container with access to the task workspace files. "
+        "Agent secrets are available as environment variables via os.environ['KEY_NAME']. "
+        "Use this for computation, file processing, API calls, data analysis, or any task requiring code execution. "
+        "Write results to stdout with print(). Write files to persist them."
     ),
     "parameters": {
         "type": "object",
@@ -143,7 +158,7 @@ SANDBOX_TOOL_DEF = {
             },
             "entry_point": {
                 "type": "string",
-                "description": "Filename for the script, default is main.py",
+                "description": "Filename for the script. Default: main.py",
             },
         },
         "required": ["code"],
@@ -158,13 +173,13 @@ async def handle_sandbox_tool_call(
     agent_id: str,
     org_id: str,
     all_secrets: dict[str, dict],
+    agent_secrets: dict[str, str],
     environment: dict,
     steps: list,
 ) -> tuple[str, list]:
-    code       = call["arguments"].get("code", "")
+    code        = call["arguments"].get("code", "")
     entry_point = call["arguments"].get("entry_point", "main.py")
 
-    # Pull task files from storage into the sandbox
     task_files_meta = load_task_files(task_id)
     workspace_files: dict[str, bytes] = {}
     for f in task_files_meta:
@@ -173,10 +188,10 @@ async def handle_sandbox_tool_call(
         except Exception:
             pass
 
-    # Flatten all toolset secrets into one dict for env injection
     flat_secrets: dict[str, str] = {}
     for secrets_dict in all_secrets.values():
         flat_secrets.update(secrets_dict)
+    flat_secrets.update(agent_secrets)
 
     packages = environment.get("packages", [])
 
@@ -198,13 +213,11 @@ async def handle_sandbox_tool_call(
         duration_ms=result.get("duration_ms", 0),
     )
 
-    # Push any new output files back to storage
     for filename, b64_content in result.get("output_files", {}).items():
         import base64
         content = base64.b64decode(b64_content)
         storage_path = f"{org_id}/{agent_id}/{task_id}/{filename}"
         push_file_to_storage(storage_path, content)
-
         supabase.from_("task_files").upsert({
             "task_id":      task_id,
             "agent_id":     agent_id,
@@ -216,13 +229,13 @@ async def handle_sandbox_tool_call(
         }).execute()
 
     steps = append_step(run_id, steps, {
-        "type":        "sandbox_output",
-        "exit_code":   result.get("exit_code"),
-        "stdout":      result.get("stdout", ""),
-        "stderr":      result.get("stderr", ""),
-        "duration_ms": result.get("duration_ms", 0),
+        "type":         "sandbox_output",
+        "exit_code":    result.get("exit_code"),
+        "stdout":       result.get("stdout", ""),
+        "stderr":       result.get("stderr", ""),
+        "duration_ms":  result.get("duration_ms", 0),
         "output_files": list(result.get("output_files", {}).keys()),
-        "timestamp":   now_iso(),
+        "timestamp":    now_iso(),
     })
 
     if result.get("exit_code", -1) != 0:
@@ -237,8 +250,6 @@ async def handle_sandbox_tool_call(
     return return_content, steps
 
 
-# ─── Main runner ──────────────────────────────────────────────────────────────
-
 async def run_agent_task(run_id: str, task_id: str, agent_id: str):
     steps: list[dict] = []
 
@@ -250,14 +261,20 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
         contexts    = load_contexts(agent_id)
         tools       = load_tools(agent_id)
         environment = load_environment(agent_id)
+        org_id      = task["org_id"]
 
-        org_id = task["org_id"]
+        enabled_platform_tools = load_agent_platform_tools(agent_id)
+        agent_secrets          = await fetch_agent_secrets(agent_id)
 
-        system_prompt = build_system_prompt(agent, contexts)
-        tool_defs     = build_tool_definitions(tools) + [SANDBOX_TOOL_DEF]
-        tool_map      = {t["name"]: t for t in tools}
+        system_prompt = build_system_prompt(agent, contexts, list(agent_secrets.keys()))
 
+        tool_defs = build_tool_definitions(tools)
+        if "execute_code" in enabled_platform_tools:
+            tool_defs.append(SANDBOX_TOOL_DEF)
+
+        tool_map    = {t["name"]: t for t in tools}
         toolset_ids = list({t["toolset_id"] for t in tools})
+
         all_secrets: dict[str, dict] = {}
         for tsid in toolset_ids:
             all_secrets[tsid] = await fetch_secrets(tsid)
@@ -314,10 +331,7 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
                     {
                         "id":       c["id"],
                         "type":     "function",
-                        "function": {
-                            "name":      c["name"],
-                            "arguments": json.dumps(c["arguments"]),
-                        },
+                        "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])},
                     }
                     for c in calls
                 ],
@@ -336,7 +350,6 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
                     "timestamp": now_iso(),
                 })
 
-                # ── Built-in sandbox tool ──
                 if tool_name == "execute_code":
                     tool_result_content, steps = await handle_sandbox_tool_call(
                         call=call,
@@ -345,11 +358,11 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
                         agent_id=agent_id,
                         org_id=org_id,
                         all_secrets=all_secrets,
+                        agent_secrets=agent_secrets,
                         environment=environment,
                         steps=steps,
                     )
                 else:
-                    # ── Regular tool call (existing path, untouched) ──
                     tool = tool_map.get(tool_name)
                     if not tool:
                         tool_result_content = f"Error: tool '{tool_name}' not found."
@@ -363,13 +376,9 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
                             secrets=secrets,
                         )
                         if exec_result["ok"]:
-                            tool_result_content = (
-                                f"Tool `{tool_name}` returned: {json.dumps(exec_result['result'])}"
-                            )
+                            tool_result_content = f"Tool `{tool_name}` returned: {json.dumps(exec_result['result'])}"
                         else:
-                            tool_result_content = (
-                                f"Tool `{tool_name}` failed: {exec_result['error']}"
-                            )
+                            tool_result_content = f"Tool `{tool_name}` failed: {exec_result['error']}"
 
                 steps = append_step(run_id, steps, {
                     "type":      "tool_result",
