@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 from db import supabase
 
-router = APIRouter(prefix="/agents", tags=["agent-config"])
+router = APIRouter(prefix="/agent-config", tags=["agent-config"])
 
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
