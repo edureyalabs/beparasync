@@ -15,9 +15,9 @@ class UpdatePackagesRequest(BaseModel):
 
 
 def _get_or_create(agent_id: str, org_id: str) -> dict:
-    res = supabase.from_("agent_environments").select("*").eq("agent_id", agent_id).single().execute()
+    res = supabase.from_("agent_environments").select("*").eq("agent_id", agent_id).execute()
     if res.data:
-        return res.data
+        return res.data[0]
 
     created = supabase.from_("agent_environments").insert({
         "agent_id": agent_id,
