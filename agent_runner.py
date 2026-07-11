@@ -14,6 +14,7 @@ from sandbox_client import run_in_sandbox
 from memory_manager import get_memory, build_memory_block, MEMORY_TOOL_DEF, apply_memory_action
 from workspace_manager import pull_workspace, push_workspace, snapshot_hashes, get_task_md
 from web_search import run_web_search
+from browser_client import run_in_browser
 
 
 def now_iso() -> str:
@@ -176,6 +177,35 @@ WEB_SEARCH_TOOL_DEF = {
     },
 }
 
+BROWSE_WEB_TOOL_DEF = {
+    "name": "browse_web",
+    "description": (
+        "Browse the web using a full AI-powered browser. "
+        "Can navigate pages, click buttons, fill forms, and extract content from any website "
+        "including JavaScript-rendered pages and sites behind Cloudflare. "
+        "Use this when web_search results are not enough and you need to actually visit and interact with a page. "
+        "Slower than web_search — prefer web_search for simple lookups."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "Natural language instruction describing what to do in the browser.",
+            },
+            "start_url": {
+                "type": "string",
+                "description": "Optional URL to start from. If not provided the agent will navigate on its own.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Max seconds to run the browser task. Default: 120.",
+            },
+        },
+        "required": ["task"],
+    },
+}
+
 
 async def handle_sandbox_tool_call(
     call: dict,
@@ -192,7 +222,6 @@ async def handle_sandbox_tool_call(
     code        = call["arguments"].get("code", "")
     entry_point = call["arguments"].get("entry_point", "main.py")
 
-    # Encode workspace files for sandbox
     workspace_files: dict[str, bytes] = {}
     if workspace_dir.exists():
         for f in workspace_dir.rglob("*"):
@@ -223,7 +252,6 @@ async def handle_sandbox_tool_call(
         duration_ms=result.get("duration_ms", 0),
     )
 
-    # Write output files back to local workspace dir for later push
     import base64
     for filename, b64 in result.get("output_files", {}).items():
         dest = workspace_dir / filename
@@ -269,11 +297,9 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
         agent_secrets          = await fetch_agent_secrets(agent_id)
         memory                 = get_memory(agent_id)
 
-        # Pull workspace from storage
         pull_workspace(org_id, agent_id, task_id, workspace_dir)
         pre_run_hashes = snapshot_hashes(workspace_dir)
 
-        # Get TASK.md if it exists
         task_md = ""
         task_md_path = workspace_dir / "TASK.md"
         if task_md_path.exists():
@@ -290,6 +316,8 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
             tool_defs.append(SANDBOX_TOOL_DEF)
         if "web_search" in enabled_platform_tools:
             tool_defs.append(WEB_SEARCH_TOOL_DEF)
+        if "browse_web" in enabled_platform_tools:
+            tool_defs.append(BROWSE_WEB_TOOL_DEF)
 
         tool_map    = {t["name"]: t for t in tools}
         toolset_ids = list({t["toolset_id"] for t in tools})
@@ -375,6 +403,27 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
                     count = tool_args.get("count", 5)
                     tool_result_content = await run_web_search(query, count)
 
+                elif tool_name == "browse_web":
+                    flat_secrets: dict[str, str] = {}
+                    for d in all_secrets.values():
+                        flat_secrets.update(d)
+                    flat_secrets.update(agent_secrets)
+                    result = await run_in_browser(
+                        task=tool_args.get("task", ""),
+                        start_url=tool_args.get("start_url"),
+                        env_vars=flat_secrets,
+                        timeout=tool_args.get("timeout", 120),
+                    )
+                    if result["ok"]:
+                        steps_summary = ", ".join(result.get("steps", [])[:5])
+                        tool_result_content = (
+                            f"Browser task completed.\n"
+                            f"Steps taken: {steps_summary}\n\n"
+                            f"Result:\n{result['result']}"
+                        )
+                    else:
+                        tool_result_content = f"Browser task failed: {result.get('error', 'Unknown error')}"
+
                 else:
                     tool = tool_map.get(tool_name)
                     if not tool:
@@ -411,7 +460,6 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
         })
 
     finally:
-        # Push workspace changes back to storage regardless of success/failure
         try:
             push_workspace(org_id, agent_id, task_id, workspace_dir, pre_run_hashes)
         except Exception:

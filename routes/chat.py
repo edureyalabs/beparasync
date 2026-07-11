@@ -17,6 +17,7 @@ from memory_manager import (
 )
 from workspace_manager import get_task_md
 from web_search import run_web_search
+from browser_client import run_in_browser
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -174,6 +175,35 @@ WEB_SEARCH_TOOL_DEF = {
     },
 }
 
+BROWSE_WEB_TOOL_DEF = {
+    "name": "browse_web",
+    "description": (
+        "Browse the web using a full AI-powered browser. "
+        "Can navigate pages, click buttons, fill forms, and extract content from any website "
+        "including JavaScript-rendered pages and sites behind Cloudflare. "
+        "Use this when web_search results are not enough and you need to actually visit and interact with a page. "
+        "Slower than web_search — prefer web_search for simple lookups."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "Natural language instruction describing what to do in the browser.",
+            },
+            "start_url": {
+                "type": "string",
+                "description": "Optional URL to start from. If not provided the agent will navigate on its own.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Max seconds to run the browser task. Default: 120.",
+            },
+        },
+        "required": ["task"],
+    },
+}
+
 
 def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) -> str:
     org_res  = supabase.from_("organizations").select("owner_id").eq("id", org_id).execute()
@@ -269,6 +299,7 @@ def build_chat_system_prompt(
         "You can use tools to:\n"
         "- Execute code in a sandbox (execute_code — if enabled)\n"
         "- Search the web for current information (web_search — if enabled)\n"
+        "- Browse the web with a full browser agent (browse_web — if enabled)\n"
         "- Create and run tasks (create_task, run_task, list_tasks)\n"
         "- Search past conversations (search_history)\n"
         "- Update your persistent memory (memory)\n"
@@ -281,7 +312,6 @@ def build_chat_system_prompt(
 
 
 def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[dict]:
-    # collect tool_call_ids that have a matching tool result
     covered = set()
     for msg in recent_messages:
         if msg["role"] == "tool":
@@ -341,7 +371,6 @@ async def chat(agent_id: str, body: ChatRequest):
     recent_msgs    = load_recent_messages(agent_id)
     agent_secrets  = await fetch_agent_secrets(agent_id)
 
-    # resolve which task to use as workspace target for execute_code
     resolved_task_id = resolve_task_id(agent_id, body.active_task_id)
 
     task_md = ""
@@ -375,6 +404,9 @@ async def chat(agent_id: str, body: ChatRequest):
 
     if "web_search" in platform_tools:
         tool_defs.append(WEB_SEARCH_TOOL_DEF)
+
+    if "browse_web" in platform_tools:
+        tool_defs.append(BROWSE_WEB_TOOL_DEF)
 
     save_message(agent_id, body.org_id, "user", body.message, task_id=resolved_task_id)
 
@@ -471,6 +503,27 @@ async def chat(agent_id: str, body: ChatRequest):
                 query = tool_args.get("query", "")
                 count = tool_args.get("count", 5)
                 result_content = await run_web_search(query, count)
+
+            elif tool_name == "browse_web":
+                flat_secrets: dict[str, str] = {}
+                for d in all_secrets.values():
+                    flat_secrets.update(d)
+                flat_secrets.update(agent_secrets)
+                result = await run_in_browser(
+                    task=tool_args.get("task", ""),
+                    start_url=tool_args.get("start_url"),
+                    env_vars=flat_secrets,
+                    timeout=tool_args.get("timeout", 120),
+                )
+                if result["ok"]:
+                    steps_summary = ", ".join(result.get("steps", [])[:5])
+                    result_content = (
+                        f"Browser task completed.\n"
+                        f"Steps taken: {steps_summary}\n\n"
+                        f"Result:\n{result['result']}"
+                    )
+                else:
+                    result_content = f"Browser task failed: {result.get('error', 'Unknown error')}"
 
             else:
                 tool = tool_map.get(tool_name)
