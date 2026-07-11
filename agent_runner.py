@@ -21,7 +21,8 @@ def now_iso() -> str:
 
 def append_step(run_id: str, steps: list, step: dict) -> list:
     steps = [*steps, step]
-    supabase.from_("runs").update({"steps": steps}).eq("id", run_id).execute()
+    if run_id:
+        supabase.from_("runs").update({"steps": steps}).eq("id", run_id).execute()
     return steps
 
 
