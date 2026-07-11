@@ -16,6 +16,7 @@ from memory_manager import (
     MEMORY_TOOL_DEF, SEARCH_HISTORY_TOOL_DEF,
 )
 from workspace_manager import get_task_md
+from web_search import run_web_search
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -150,6 +151,29 @@ LIST_TASKS_TOOL = {
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
+WEB_SEARCH_TOOL_DEF = {
+    "name": "web_search",
+    "description": (
+        "Search the web for current information. "
+        "Returns titles, URLs, and descriptions of the top results. "
+        "Use this when you need up-to-date information, facts, or URLs."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query.",
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of results to return (1-10). Default: 5.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 
 def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) -> str:
     org_res  = supabase.from_("organizations").select("owner_id").eq("id", org_id).execute()
@@ -244,6 +268,7 @@ def build_chat_system_prompt(
         "\n\n== CAPABILITIES ==\n"
         "You can use tools to:\n"
         "- Execute code in a sandbox (execute_code — if enabled)\n"
+        "- Search the web for current information (web_search — if enabled)\n"
         "- Create and run tasks (create_task, run_task, list_tasks)\n"
         "- Search past conversations (search_history)\n"
         "- Update your persistent memory (memory)\n"
@@ -348,6 +373,9 @@ async def chat(agent_id: str, body: ChatRequest):
         from agent_runner import SANDBOX_TOOL_DEF
         tool_defs.append(SANDBOX_TOOL_DEF)
 
+    if "web_search" in platform_tools:
+        tool_defs.append(WEB_SEARCH_TOOL_DEF)
+
     save_message(agent_id, body.org_id, "user", body.message, task_id=resolved_task_id)
 
     llm      = get_llm_client()
@@ -438,6 +466,11 @@ async def chat(agent_id: str, body: ChatRequest):
                     workspace_dir=workspace_dir,
                     steps=[],
                 )
+
+            elif tool_name == "web_search":
+                query = tool_args.get("query", "")
+                count = tool_args.get("count", 5)
+                result_content = await run_web_search(query, count)
 
             else:
                 tool = tool_map.get(tool_name)
