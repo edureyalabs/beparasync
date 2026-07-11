@@ -136,10 +136,16 @@ LIST_TASKS_TOOL = {
 
 
 def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) -> str:
+    # get org owner to use as created_by (must be a valid profile id)
+    org_res = supabase.from_("organizations").select("owner_id").eq("id", org_id).execute()
+    owner_id = org_res.data[0]["owner_id"] if org_res.data else None
+    if not owner_id:
+        return "Could not create task: unable to resolve org owner."
+
     res = supabase.from_("tasks").insert({
         "agent_id":     agent_id,
         "org_id":       org_id,
-        "created_by":   agent_id,
+        "created_by":   owner_id,
         "name":         name,
         "instruction":  instruction,
         "trigger_type": "manual",
