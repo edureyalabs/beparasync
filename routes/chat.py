@@ -243,6 +243,15 @@ def build_chat_system_prompt(
 
 
 def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[dict]:
+    # Build a set of tool_call_ids that have corresponding tool results
+    covered_tool_call_ids = set()
+    for msg in recent_messages:
+        if msg["role"] == "tool":
+            meta = msg.get("meta") or {}
+            tid = meta.get("tool_call_id")
+            if tid:
+                covered_tool_call_ids.add(tid)
+
     messages = []
     for msg in recent_messages:
         if msg["role"] == "user":
@@ -252,26 +261,31 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
             if msg.get("tool_calls"):
                 normalized = []
                 for tc in msg["tool_calls"]:
+                    tc_id   = tc.get("id", "")
+                    tc_name = tc.get("name") or tc.get("function", {}).get("name", "")
+                    tc_args = tc.get("arguments") or tc.get("function", {}).get("arguments", "{}")
+                    # skip tool calls with no name or whose result is missing
+                    if not tc_name or tc_id not in covered_tool_call_ids:
+                        continue
                     normalized.append({
-                        "id":       tc.get("id", f"call_{len(normalized)}"),
+                        "id":       tc_id,
                         "type":     "function",
-                        "function": {
-                            "name":      tc.get("name") or tc.get("function", {}).get("name", ""),
-                            "arguments": tc.get("arguments") or tc.get("function", {}).get("arguments", "{}"),
-                        },
+                        "function": {"name": tc_name, "arguments": tc_args},
                     })
-                messages.append({
-                    "role":       "assistant",
-                    "content":    None,
-                    "tool_calls": normalized,
-                })
+                # only add the assistant message if all tool calls have results
+                if normalized:
+                    messages.append({
+                        "role":       "assistant",
+                        "content":    None,
+                        "tool_calls": normalized,
+                    })
+                # if normalized is empty, skip this message entirely
             else:
                 messages.append({"role": "assistant", "content": msg["content"] or ""})
 
         elif msg["role"] == "tool":
             meta = msg.get("meta") or {}
             tool_call_id = meta.get("tool_call_id")
-            # skip tool messages without a valid tool_call_id — they break the LLM message chain
             if not tool_call_id:
                 continue
             messages.append({
@@ -282,7 +296,6 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
 
     messages.append({"role": "user", "content": user_message})
     return messages
-
 
 @router.post("/{agent_id}")
 async def chat(agent_id: str, body: ChatRequest):
