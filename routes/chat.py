@@ -4,7 +4,6 @@ import json
 import asyncio
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Any
 
@@ -28,11 +27,8 @@ class ChatRequest(BaseModel):
     active_task_id: str | None = None
 
 
-# ─── Loaders ──────────────────────────────────────────────────────────────────
-
 def load_agent(agent_id: str) -> dict:
-    res = supabase.from_("agents").select("*").eq("id", agent_id).single().execute()
-    return res.data
+    return supabase.from_("agents").select("*").eq("id", agent_id).single().execute().data
 
 
 def load_contexts(agent_id: str) -> list[dict]:
@@ -61,7 +57,7 @@ def load_platform_tools(agent_id: str) -> set[str]:
 def load_recent_messages(agent_id: str, limit: int = RECENT_MSG_COUNT) -> list[dict]:
     res = (
         supabase.from_("conversations")
-        .select("role, content, tool_calls, tool_name, created_at")
+        .select("role, content, tool_calls, tool_name, meta, created_at")
         .eq("agent_id", agent_id)
         .neq("role", "summary")
         .order("created_at", desc=True)
@@ -85,15 +81,15 @@ def search_history(agent_id: str, query: str) -> str:
         return f"No conversation history found matching '{query}'."
     lines = []
     for row in res.data:
-        ts    = row["created_at"][:10]
-        role  = row["role"].upper()
-        snip  = (row["content"] or "")[:200]
+        ts   = row["created_at"][:10]
+        role = row["role"].upper()
+        snip = (row["content"] or "")[:200]
         lines.append(f"[{ts}] {role}: {snip}")
     return "\n".join(lines)
 
 
 def save_message(agent_id: str, org_id: str, role: str, content: str = "",
-                 tool_calls: Any = None, tool_name: str = "", 
+                 tool_calls: Any = None, tool_name: str = "",
                  task_id: str = None, meta: dict = None):
     supabase.from_("conversations").insert({
         "agent_id":   agent_id,
@@ -106,8 +102,6 @@ def save_message(agent_id: str, org_id: str, role: str, content: str = "",
         "meta":       meta or {},
     }).execute()
 
-
-# ─── Task tools ───────────────────────────────────────────────────────────────
 
 CREATE_TASK_TOOL = {
     "name": "create_task",
@@ -142,7 +136,6 @@ LIST_TASKS_TOOL = {
 
 
 def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) -> str:
-    agent = supabase.from_("agents").select("id").eq("id", agent_id).single().execute().data
     res = supabase.from_("tasks").insert({
         "agent_id":     agent_id,
         "org_id":       org_id,
@@ -158,7 +151,6 @@ def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) 
 
 def handle_run_task(task_id: str, org_id: str) -> str:
     from agent_runner import run_agent_task
-    import uuid
 
     task_res = supabase.from_("tasks").select("*").eq("id", task_id).single().execute()
     if not task_res.data:
@@ -175,7 +167,6 @@ def handle_run_task(task_id: str, org_id: str) -> str:
     }).select().single().execute()
     run = run_res.data
 
-    import asyncio
     loop = asyncio.get_event_loop()
     loop.create_task(run_agent_task(run["id"], task_id, task["agent_id"]))
 
@@ -197,13 +188,10 @@ def handle_list_tasks(agent_id: str) -> str:
     return "\n".join(lines)
 
 
-# ─── System prompt builder ────────────────────────────────────────────────────
-
 def build_chat_system_prompt(
     agent: dict,
     contexts: list[dict],
     memory: dict[str, str],
-    recent_messages: list[dict],
     task_md: str,
     active_task_id: str | None,
     agent_secret_keys: list[str],
@@ -218,16 +206,16 @@ def build_chat_system_prompt(
     parts.append("\n\n" + build_memory_block(memory))
 
     if task_md and active_task_id:
-        parts.append(f"\n\n══ ACTIVE TASK CONTEXT ══\n{task_md}")
+        parts.append(f"\n\n== ACTIVE TASK CONTEXT ==\n{task_md}")
 
     if agent_secret_keys:
-        parts.append("\n\n══ AVAILABLE SECRETS ══")
+        parts.append("\n\n== AVAILABLE SECRETS ==")
         parts.append("Available as env vars in execute_code sandbox via os.environ['KEY_NAME']:")
         for key in agent_secret_keys:
             parts.append(f"- `{key}`")
 
     parts.append(
-        "\n\n══ CAPABILITIES ══\n"
+        "\n\n== CAPABILITIES ==\n"
         "You can use tools to:\n"
         "- Execute code in a sandbox (execute_code — if enabled)\n"
         "- Create and run tasks (create_task, run_task, list_tasks)\n"
@@ -245,19 +233,18 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
     for msg in recent_messages:
         if msg["role"] == "user":
             messages.append({"role": "user", "content": msg["content"] or ""})
+
         elif msg["role"] == "assistant":
             if msg.get("tool_calls"):
-                calls = msg["tool_calls"]
-                # ensure each tool call has required fields for Groq
                 normalized = []
-                for tc in calls:
+                for tc in msg["tool_calls"]:
                     normalized.append({
                         "id":       tc.get("id", f"call_{len(normalized)}"),
                         "type":     "function",
                         "function": {
                             "name":      tc.get("name") or tc.get("function", {}).get("name", ""),
                             "arguments": tc.get("arguments") or tc.get("function", {}).get("arguments", "{}"),
-                        }
+                        },
                     })
                 messages.append({
                     "role":       "assistant",
@@ -266,17 +253,18 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
                 })
             else:
                 messages.append({"role": "assistant", "content": msg["content"] or ""})
+
         elif msg["role"] == "tool":
-            # tool messages need tool_call_id — use a placeholder if missing
+            meta = msg.get("meta") or {}
             messages.append({
                 "role":         "tool",
-                "tool_call_id": msg.get("meta", {}).get("tool_call_id", f"call_{len(messages)}"),
+                "tool_call_id": meta.get("tool_call_id", f"call_{len(messages)}"),
                 "content":      msg["content"] or "",
             })
+
     messages.append({"role": "user", "content": user_message})
     return messages
 
-# ─── POST /chat/{agent_id} ────────────────────────────────────────────────────
 
 @router.post("/{agent_id}")
 async def chat(agent_id: str, body: ChatRequest):
@@ -296,15 +284,12 @@ async def chat(agent_id: str, body: ChatRequest):
         agent=agent,
         contexts=contexts,
         memory=memory,
-        recent_messages=recent_msgs,
         task_md=task_md,
         active_task_id=body.active_task_id,
         agent_secret_keys=list(agent_secrets.keys()),
     )
 
-    # Build tool list
-    from executor import build_full_code, run_tool
-    tool_map  = {t["name"]: t for t in tools}
+    tool_map    = {t["name"]: t for t in tools}
     toolset_ids = list({t["toolset_id"] for t in tools})
     all_secrets: dict[str, dict] = {}
     for tsid in toolset_ids:
@@ -320,14 +305,13 @@ async def chat(agent_id: str, body: ChatRequest):
         from agent_runner import SANDBOX_TOOL_DEF
         tool_defs.append(SANDBOX_TOOL_DEF)
 
-    # Save user message
     save_message(agent_id, body.org_id, "user", body.message, task_id=body.active_task_id)
 
     llm      = get_llm_client()
     messages = build_llm_messages(recent_msgs, body.message)
 
     MAX_ITERATIONS = 10
-    iteration = 0
+    iteration      = 0
     final_response = ""
 
     while iteration < MAX_ITERATIONS:
@@ -339,15 +323,22 @@ async def chat(agent_id: str, body: ChatRequest):
             save_message(agent_id, body.org_id, "assistant", final_response, task_id=body.active_task_id)
             break
 
-        # Handle tool calls
         calls = llm_result["calls"]
-        save_message(agent_id, body.org_id, "tool", result_content,
-             tool_name=tool_name, task_id=body.active_task_id,
-             meta={"tool_call_id": call["id"]})
+
+        # Save assistant message with tool calls
+        save_message(
+            agent_id, body.org_id, "assistant",
+            tool_calls=[
+                {"id": c["id"], "type": "function",
+                 "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
+                for c in calls
+            ],
+            task_id=body.active_task_id,
+        )
 
         messages.append({
-            "role":       "assistant",
-            "content":    None,
+            "role":    "assistant",
+            "content": None,
             "tool_calls": [
                 {"id": c["id"], "type": "function",
                  "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
@@ -356,8 +347,8 @@ async def chat(agent_id: str, body: ChatRequest):
         })
 
         for call in calls:
-            tool_name = call["name"]
-            tool_args = call["arguments"]
+            tool_name      = call["name"]
+            tool_args      = call["arguments"]
             result_content = ""
 
             if tool_name == "memory":
@@ -392,15 +383,17 @@ async def chat(agent_id: str, body: ChatRequest):
                 if env_res.data:
                     environment = env_res.data[0]
 
-                fake_run_id = f"chat_{agent_id[:8]}"
-                flat = {**{k: v for d in all_secrets.values() for k, v in d.items()}, **agent_secrets}
-
                 result_content, _ = await handle_sandbox_tool_call(
-                    call=call, run_id=fake_run_id,
+                    call=call,
+                    run_id=f"chat_{agent_id[:8]}",
                     task_id=body.active_task_id or agent_id,
-                    agent_id=agent_id, org_id=body.org_id,
-                    all_secrets=all_secrets, agent_secrets=agent_secrets,
-                    environment=environment, steps=[],
+                    agent_id=agent_id,
+                    org_id=body.org_id,
+                    all_secrets=all_secrets,
+                    agent_secrets=agent_secrets,
+                    environment=environment,
+                    workspace_dir=__import__('pathlib').Path(__import__('tempfile').mkdtemp()),
+                    steps=[],
                 )
 
             else:
@@ -413,8 +406,11 @@ async def chat(agent_id: str, body: ChatRequest):
                     res       = await run_tool(full_code, tool["name"], tool_args, secrets)
                     result_content = json.dumps(res["result"]) if res["ok"] else f"Error: {res['error']}"
 
-            save_message(agent_id, body.org_id, "tool", result_content,
-                         tool_name=tool_name, task_id=body.active_task_id)
+            save_message(
+                agent_id, body.org_id, "tool", result_content,
+                tool_name=tool_name, task_id=body.active_task_id,
+                meta={"tool_call_id": call["id"]},
+            )
 
             messages.append({
                 "role":         "tool",
@@ -424,8 +420,6 @@ async def chat(agent_id: str, body: ChatRequest):
 
     return {"response": final_response, "iterations": iteration}
 
-
-# ─── GET /chat/{agent_id}/history ─────────────────────────────────────────────
 
 @router.get("/{agent_id}/history")
 def get_history(agent_id: str, limit: int = 50, offset: int = 0):
@@ -441,14 +435,10 @@ def get_history(agent_id: str, limit: int = 50, offset: int = 0):
     return list(reversed(res.data or []))
 
 
-# ─── GET /chat/{agent_id}/memory ──────────────────────────────────────────────
-
 @router.get("/{agent_id}/memory")
 def get_agent_memory(agent_id: str):
     return get_memory(agent_id)
 
-
-# ─── DELETE /chat/{agent_id}/history ─────────────────────────────────────────
 
 @router.delete("/{agent_id}/history")
 def clear_history(agent_id: str):
