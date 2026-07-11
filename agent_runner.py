@@ -13,6 +13,7 @@ from llm.factory import get_llm_client
 from sandbox_client import run_in_sandbox
 from memory_manager import get_memory, build_memory_block, MEMORY_TOOL_DEF, apply_memory_action
 from workspace_manager import pull_workspace, push_workspace, snapshot_hashes, get_task_md
+from web_search import run_web_search
 
 
 def now_iso() -> str:
@@ -152,6 +153,29 @@ SANDBOX_TOOL_DEF = {
     },
 }
 
+WEB_SEARCH_TOOL_DEF = {
+    "name": "web_search",
+    "description": (
+        "Search the web for current information. "
+        "Returns titles, URLs, and descriptions of the top results. "
+        "Use this when you need up-to-date information, facts, or URLs."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query.",
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of results to return (1-10). Default: 5.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 
 async def handle_sandbox_tool_call(
     call: dict,
@@ -264,6 +288,8 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
         tool_defs = build_tool_definitions(tools) + [MEMORY_TOOL_DEF]
         if "execute_code" in enabled_platform_tools:
             tool_defs.append(SANDBOX_TOOL_DEF)
+        if "web_search" in enabled_platform_tools:
+            tool_defs.append(WEB_SEARCH_TOOL_DEF)
 
         tool_map    = {t["name"]: t for t in tools}
         toolset_ids = list({t["toolset_id"] for t in tools})
@@ -343,6 +369,11 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
                         environment=environment, workspace_dir=workspace_dir,
                         steps=steps,
                     )
+
+                elif tool_name == "web_search":
+                    query = tool_args.get("query", "")
+                    count = tool_args.get("count", 5)
+                    tool_result_content = await run_web_search(query, count)
 
                 else:
                     tool = tool_map.get(tool_name)
