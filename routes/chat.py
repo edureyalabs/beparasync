@@ -144,9 +144,10 @@ def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) 
         "instruction":  instruction,
         "trigger_type": "manual",
         "is_active":    True,
-    }).select().single().execute()
-    task = res.data
-    return f"Task created: '{name}' (ID: {task['id']})"
+    }).execute()
+    rows = res.data or []
+    task_id_created = rows[0]["id"] if rows else "unknown"
+    return f"Task created: '{name}' (ID: {task_id_created})"
 
 
 def handle_run_task(task_id: str, org_id: str) -> str:
@@ -156,10 +157,10 @@ def handle_run_task(task_id: str, org_id: str) -> str:
     if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', task_id or ''):
         return f"Invalid task_id '{task_id}'. Use list_tasks to get the full UUID of the task you want to run."
 
-    task_res = supabase.from_("tasks").select("*").eq("id", task_id).single().execute()
+    task_res = supabase.from_("tasks").select("*").eq("id", task_id).execute()
     if not task_res.data:
         return f"Task {task_id} not found."
-    task = task_res.data
+    task = task_res.data[0]
 
     run_res = supabase.from_("runs").insert({
         "task_id":      task_id,
@@ -168,13 +169,16 @@ def handle_run_task(task_id: str, org_id: str) -> str:
         "status":       "queued",
         "triggered_by": "agent_chat",
         "steps":        [],
-    }).select().single().execute()
-    run = run_res.data
+    }).execute()
+    run_rows = run_res.data or []
+    run_id = run_rows[0]["id"] if run_rows else None
+    if not run_id:
+        return f"Task '{task['name']}' queued but run ID unavailable."
 
     loop = asyncio.get_event_loop()
-    loop.create_task(run_agent_task(run["id"], task_id, task["agent_id"]))
+    loop.create_task(run_agent_task(run_id, task_id, task["agent_id"]))
 
-    return f"Task '{task['name']}' started. Run ID: {run['id']} — status: queued"
+    return f"Task '{task['name']}' started. Run ID: {run_id} — status: queued"
 
 
 def handle_list_tasks(agent_id: str) -> str:
@@ -260,9 +264,13 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
 
         elif msg["role"] == "tool":
             meta = msg.get("meta") or {}
+            tool_call_id = meta.get("tool_call_id")
+            # skip tool messages without a valid tool_call_id — they break the LLM message chain
+            if not tool_call_id:
+                continue
             messages.append({
                 "role":         "tool",
-                "tool_call_id": meta.get("tool_call_id", f"call_{len(messages)}"),
+                "tool_call_id": tool_call_id,
                 "content":      msg["content"] or "",
             })
 
