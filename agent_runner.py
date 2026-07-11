@@ -73,9 +73,14 @@ def push_file_to_storage(storage_path: str, content: bytes, mime_type: str = "ap
 
 
 def write_execution_log(run_id: str, stdout: str, stderr: str, exit_code: int, duration_ms: int):
+    if not run_id:
+        return
     supabase.from_("execution_logs").upsert({
-        "run_id": run_id, "stdout": stdout, "stderr": stderr,
-        "exit_code": exit_code, "duration_ms": duration_ms,
+        "run_id":      run_id,
+        "stdout":      stdout,
+        "stderr":      stderr,
+        "exit_code":   exit_code,
+        "duration_ms": duration_ms,
     }, on_conflict="run_id").execute()
 
 

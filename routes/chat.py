@@ -403,7 +403,7 @@ async def chat(agent_id: str, body: ChatRequest):
 
                 result_content, _ = await handle_sandbox_tool_call(
                     call=call,
-                    run_id=f"chat_{agent_id[:8]}",
+                    run_id=None,
                     task_id=body.active_task_id or agent_id,
                     agent_id=agent_id,
                     org_id=body.org_id,
