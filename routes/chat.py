@@ -2,10 +2,11 @@
 
 import json
 import asyncio
-from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Any
+from pathlib import Path
+import tempfile
 
 from db import supabase
 from llm.factory import get_llm_client
@@ -67,6 +68,21 @@ def load_recent_messages(agent_id: str, limit: int = RECENT_MSG_COUNT) -> list[d
     return list(reversed(res.data or []))
 
 
+def resolve_task_id(agent_id: str, active_task_id: str | None) -> str | None:
+    if active_task_id:
+        return active_task_id
+    res = (
+        supabase.from_("tasks")
+        .select("id")
+        .eq("agent_id", agent_id)
+        .eq("is_active", True)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0]["id"] if res.data else None
+
+
 def search_history(agent_id: str, query: str) -> str:
     res = (
         supabase.from_("conversations")
@@ -110,7 +126,7 @@ CREATE_TASK_TOOL = {
         "type": "object",
         "properties": {
             "name":        {"type": "string", "description": "Short task name."},
-            "instruction": {"type": "string", "description": "Detailed task instruction — what to do and how."},
+            "instruction": {"type": "string", "description": "Detailed task instruction."},
         },
         "required": ["name", "instruction"],
     },
@@ -122,7 +138,7 @@ RUN_TASK_TOOL = {
     "parameters": {
         "type": "object",
         "properties": {
-            "task_id": {"type": "string", "description": "The task ID to run."},
+            "task_id": {"type": "string", "description": "The full UUID task ID to run."},
         },
         "required": ["task_id"],
     },
@@ -130,19 +146,17 @@ RUN_TASK_TOOL = {
 
 LIST_TASKS_TOOL = {
     "name": "list_tasks",
-    "description": "List all your tasks with their current status.",
+    "description": "List all your tasks with their full task_id UUIDs and status.",
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
 
 def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) -> str:
-    # get org owner to use as created_by (must be a valid profile id)
-    org_res = supabase.from_("organizations").select("owner_id").eq("id", org_id).execute()
+    org_res  = supabase.from_("organizations").select("owner_id").eq("id", org_id).execute()
     owner_id = org_res.data[0]["owner_id"] if org_res.data else None
     if not owner_id:
         return "Could not create task: unable to resolve org owner."
-
-    res = supabase.from_("tasks").insert({
+    res  = supabase.from_("tasks").insert({
         "agent_id":     agent_id,
         "org_id":       org_id,
         "created_by":   owner_id,
@@ -152,22 +166,19 @@ def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) 
         "is_active":    True,
     }).execute()
     rows = res.data or []
-    task_id_created = rows[0]["id"] if rows else "unknown"
-    return f"Task created: '{name}' (ID: {task_id_created})"
+    tid  = rows[0]["id"] if rows else "unknown"
+    return f"Task created: '{name}' (ID: {tid})"
 
 
 def handle_run_task(task_id: str, org_id: str) -> str:
-    from agent_runner import run_agent_task
     import re
-
+    from agent_runner import run_agent_task
     if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', task_id or ''):
-        return f"Invalid task_id '{task_id}'. Use list_tasks to get the full UUID of the task you want to run."
-
+        return f"Invalid task_id '{task_id}'. Use list_tasks to get the full UUID."
     task_res = supabase.from_("tasks").select("*").eq("id", task_id).execute()
     if not task_res.data:
         return f"Task {task_id} not found."
-    task = task_res.data[0]
-
+    task    = task_res.data[0]
     run_res = supabase.from_("runs").insert({
         "task_id":      task_id,
         "agent_id":     task["agent_id"],
@@ -177,13 +188,11 @@ def handle_run_task(task_id: str, org_id: str) -> str:
         "steps":        [],
     }).execute()
     run_rows = run_res.data or []
-    run_id = run_rows[0]["id"] if run_rows else None
+    run_id   = run_rows[0]["id"] if run_rows else None
     if not run_id:
         return f"Task '{task['name']}' queued but run ID unavailable."
-
     loop = asyncio.get_event_loop()
     loop.create_task(run_agent_task(run_id, task_id, task["agent_id"]))
-
     return f"Task '{task['name']}' started. Run ID: {run_id} — status: queued"
 
 
@@ -198,7 +207,10 @@ def handle_list_tasks(agent_id: str) -> str:
     )
     if not res.data:
         return "No tasks yet."
-    lines = [f"- {t['name']} | task_id: {t['id']} | {'active' if t['is_active'] else 'inactive'}" for t in res.data]
+    lines = [
+        f"- {t['name']} | task_id: {t['id']} | {'active' if t['is_active'] else 'inactive'}"
+        for t in res.data
+    ]
     return "\n".join(lines)
 
 
@@ -207,7 +219,7 @@ def build_chat_system_prompt(
     contexts: list[dict],
     memory: dict[str, str],
     task_md: str,
-    active_task_id: str | None,
+    resolved_task_id: str | None,
     agent_secret_keys: list[str],
 ) -> str:
     parts = [agent["system_prompt"].strip()]
@@ -219,7 +231,7 @@ def build_chat_system_prompt(
 
     parts.append("\n\n" + build_memory_block(memory))
 
-    if task_md and active_task_id:
+    if task_md and resolved_task_id:
         parts.append(f"\n\n== ACTIVE TASK CONTEXT ==\n{task_md}")
 
     if agent_secret_keys:
@@ -235,7 +247,8 @@ def build_chat_system_prompt(
         "- Create and run tasks (create_task, run_task, list_tasks)\n"
         "- Search past conversations (search_history)\n"
         "- Update your persistent memory (memory)\n"
-        "When the user asks you to do something that requires structured work, create a task for it.\n"
+        "When writing files via execute_code, they are persisted in your task workspace automatically.\n"
+        "Always use list_tasks to get full task UUIDs before calling run_task.\n"
         "Always update your AGENT.md memory with important facts you discover."
     )
 
@@ -243,14 +256,13 @@ def build_chat_system_prompt(
 
 
 def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[dict]:
-    # Build a set of tool_call_ids that have corresponding tool results
-    covered_tool_call_ids = set()
+    # collect tool_call_ids that have a matching tool result
+    covered = set()
     for msg in recent_messages:
         if msg["role"] == "tool":
-            meta = msg.get("meta") or {}
-            tid = meta.get("tool_call_id")
+            tid = (msg.get("meta") or {}).get("tool_call_id")
             if tid:
-                covered_tool_call_ids.add(tid)
+                covered.add(tid)
 
     messages = []
     for msg in recent_messages:
@@ -264,28 +276,24 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
                     tc_id   = tc.get("id", "")
                     tc_name = tc.get("name") or tc.get("function", {}).get("name", "")
                     tc_args = tc.get("arguments") or tc.get("function", {}).get("arguments", "{}")
-                    # skip tool calls with no name or whose result is missing
-                    if not tc_name or tc_id not in covered_tool_call_ids:
+                    if not tc_name or tc_id not in covered:
                         continue
                     normalized.append({
                         "id":       tc_id,
                         "type":     "function",
                         "function": {"name": tc_name, "arguments": tc_args},
                     })
-                # only add the assistant message if all tool calls have results
                 if normalized:
                     messages.append({
                         "role":       "assistant",
                         "content":    None,
                         "tool_calls": normalized,
                     })
-                # if normalized is empty, skip this message entirely
             else:
                 messages.append({"role": "assistant", "content": msg["content"] or ""})
 
         elif msg["role"] == "tool":
-            meta = msg.get("meta") or {}
-            tool_call_id = meta.get("tool_call_id")
+            tool_call_id = (msg.get("meta") or {}).get("tool_call_id")
             if not tool_call_id:
                 continue
             messages.append({
@@ -297,6 +305,7 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
     messages.append({"role": "user", "content": user_message})
     return messages
 
+
 @router.post("/{agent_id}")
 async def chat(agent_id: str, body: ChatRequest):
     agent          = load_agent(agent_id)
@@ -307,16 +316,19 @@ async def chat(agent_id: str, body: ChatRequest):
     recent_msgs    = load_recent_messages(agent_id)
     agent_secrets  = await fetch_agent_secrets(agent_id)
 
+    # resolve which task to use as workspace target for execute_code
+    resolved_task_id = resolve_task_id(agent_id, body.active_task_id)
+
     task_md = ""
-    if body.active_task_id:
-        task_md = get_task_md(body.org_id, agent_id, body.active_task_id)
+    if resolved_task_id:
+        task_md = get_task_md(body.org_id, agent_id, resolved_task_id)
 
     system_prompt = build_chat_system_prompt(
         agent=agent,
         contexts=contexts,
         memory=memory,
         task_md=task_md,
-        active_task_id=body.active_task_id,
+        resolved_task_id=resolved_task_id,
         agent_secret_keys=list(agent_secrets.keys()),
     )
 
@@ -336,7 +348,7 @@ async def chat(agent_id: str, body: ChatRequest):
         from agent_runner import SANDBOX_TOOL_DEF
         tool_defs.append(SANDBOX_TOOL_DEF)
 
-    save_message(agent_id, body.org_id, "user", body.message, task_id=body.active_task_id)
+    save_message(agent_id, body.org_id, "user", body.message, task_id=resolved_task_id)
 
     llm      = get_llm_client()
     messages = build_llm_messages(recent_msgs, body.message)
@@ -351,12 +363,11 @@ async def chat(agent_id: str, body: ChatRequest):
 
         if llm_result["type"] == "text":
             final_response = llm_result["content"]
-            save_message(agent_id, body.org_id, "assistant", final_response, task_id=body.active_task_id)
+            save_message(agent_id, body.org_id, "assistant", final_response, task_id=resolved_task_id)
             break
 
         calls = llm_result["calls"]
 
-        # Save assistant message with tool calls
         save_message(
             agent_id, body.org_id, "assistant",
             tool_calls=[
@@ -364,12 +375,12 @@ async def chat(agent_id: str, body: ChatRequest):
                  "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
                 for c in calls
             ],
-            task_id=body.active_task_id,
+            task_id=resolved_task_id,
         )
 
         messages.append({
-            "role":    "assistant",
-            "content": None,
+            "role":       "assistant",
+            "content":    None,
             "tool_calls": [
                 {"id": c["id"], "type": "function",
                  "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
@@ -414,16 +425,17 @@ async def chat(agent_id: str, body: ChatRequest):
                 if env_res.data:
                     environment = env_res.data[0]
 
+                workspace_dir = Path(tempfile.mkdtemp())
                 result_content, _ = await handle_sandbox_tool_call(
                     call=call,
                     run_id=None,
-                    task_id=body.active_task_id or agent_id,
+                    task_id=resolved_task_id or agent_id,
                     agent_id=agent_id,
                     org_id=body.org_id,
                     all_secrets=all_secrets,
                     agent_secrets=agent_secrets,
                     environment=environment,
-                    workspace_dir=__import__('pathlib').Path(__import__('tempfile').mkdtemp()),
+                    workspace_dir=workspace_dir,
                     steps=[],
                 )
 
@@ -439,7 +451,7 @@ async def chat(agent_id: str, body: ChatRequest):
 
             save_message(
                 agent_id, body.org_id, "tool", result_content,
-                tool_name=tool_name, task_id=body.active_task_id,
+                tool_name=tool_name, task_id=resolved_task_id,
                 meta={"tool_call_id": call["id"]},
             )
 
