@@ -93,7 +93,8 @@ def search_history(agent_id: str, query: str) -> str:
 
 
 def save_message(agent_id: str, org_id: str, role: str, content: str = "",
-                 tool_calls: Any = None, tool_name: str = "", task_id: str = None):
+                 tool_calls: Any = None, tool_name: str = "", 
+                 task_id: str = None, meta: dict = None):
     supabase.from_("conversations").insert({
         "agent_id":   agent_id,
         "org_id":     org_id,
@@ -102,6 +103,7 @@ def save_message(agent_id: str, org_id: str, role: str, content: str = "",
         "tool_calls": tool_calls,
         "tool_name":  tool_name or None,
         "task_id":    task_id,
+        "meta":       meta or {},
     }).execute()
 
 
@@ -245,21 +247,34 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
             messages.append({"role": "user", "content": msg["content"] or ""})
         elif msg["role"] == "assistant":
             if msg.get("tool_calls"):
+                calls = msg["tool_calls"]
+                # ensure each tool call has required fields for Groq
+                normalized = []
+                for tc in calls:
+                    normalized.append({
+                        "id":       tc.get("id", f"call_{len(normalized)}"),
+                        "type":     "function",
+                        "function": {
+                            "name":      tc.get("name") or tc.get("function", {}).get("name", ""),
+                            "arguments": tc.get("arguments") or tc.get("function", {}).get("arguments", "{}"),
+                        }
+                    })
                 messages.append({
                     "role":       "assistant",
                     "content":    None,
-                    "tool_calls": msg["tool_calls"],
+                    "tool_calls": normalized,
                 })
             else:
                 messages.append({"role": "assistant", "content": msg["content"] or ""})
         elif msg["role"] == "tool":
+            # tool messages need tool_call_id — use a placeholder if missing
             messages.append({
-                "role":    "tool",
-                "content": msg["content"] or "",
+                "role":         "tool",
+                "tool_call_id": msg.get("meta", {}).get("tool_call_id", f"call_{len(messages)}"),
+                "content":      msg["content"] or "",
             })
     messages.append({"role": "user", "content": user_message})
     return messages
-
 
 # ─── POST /chat/{agent_id} ────────────────────────────────────────────────────
 
@@ -326,8 +341,9 @@ async def chat(agent_id: str, body: ChatRequest):
 
         # Handle tool calls
         calls = llm_result["calls"]
-        save_message(agent_id, body.org_id, "assistant",
-                     tool_calls=calls, task_id=body.active_task_id)
+        save_message(agent_id, body.org_id, "tool", result_content,
+             tool_name=tool_name, task_id=body.active_task_id,
+             meta={"tool_call_id": call["id"]})
 
         messages.append({
             "role":       "assistant",
