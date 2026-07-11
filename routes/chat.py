@@ -151,6 +151,10 @@ def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) 
 
 def handle_run_task(task_id: str, org_id: str) -> str:
     from agent_runner import run_agent_task
+    import re
+
+    if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', task_id or ''):
+        return f"Invalid task_id '{task_id}'. Use list_tasks to get the full UUID of the task you want to run."
 
     task_res = supabase.from_("tasks").select("*").eq("id", task_id).single().execute()
     if not task_res.data:
@@ -184,7 +188,7 @@ def handle_list_tasks(agent_id: str) -> str:
     )
     if not res.data:
         return "No tasks yet."
-    lines = [f"- [{t['id'][:8]}] {t['name']} ({'active' if t['is_active'] else 'inactive'})" for t in res.data]
+    lines = [f"- {t['name']} | task_id: {t['id']} | {'active' if t['is_active'] else 'inactive'}" for t in res.data]
     return "\n".join(lines)
 
 
