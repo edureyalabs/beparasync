@@ -12,10 +12,26 @@ from workspace_manager import _storage_prefix, BUCKET
 
 router = APIRouter(prefix="/app", tags=["app"])
 
+BACKEND = os.getenv("BACKEND_URL", "")  # e.g. https://beparasync.up.railway.app
 
-def _verify(authorization: str | None):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+
+def _verify(authorization: str | None) -> str:
+    """Validate Supabase JWT and return user_id."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty token")
+    try:
+        # Validate token against Supabase — this calls the Supabase auth API
+        user_res = supabase.auth.get_user(token)
+        if not user_res or not user_res.user:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        return user_res.user.id
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Token validation failed: {e}")
 
 
 def _app_prefix(org_id: str, agent_id: str, task_id: str, app_name: str) -> str:
@@ -29,15 +45,30 @@ def _resolve_task(agent_id: str, task_id: str) -> dict:
     return res.data
 
 
+def _check_org_access(user_id: str, org_id: str):
+    """Ensure the authenticated user belongs to this org."""
+    res = (
+        supabase.from_("organizations")
+        .select("id")
+        .eq("id", org_id)
+        .eq("owner_id", user_id)
+        .single()
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
 # ── GET /app/{agent_id}/{task_id}/{app_name} → serve HTML ────────────────────
 @router.get("/{agent_id}/{task_id}/{app_name}", response_class=HTMLResponse)
 async def serve_app(
     agent_id: str, task_id: str, app_name: str,
     authorization: str | None = Header(default=None),
 ):
-    _verify(authorization)
-    task   = _resolve_task(agent_id, task_id)
-    org_id = task["org_id"]
+    user_id = _verify(authorization)
+    task    = _resolve_task(agent_id, task_id)
+    org_id  = task["org_id"]
+    _check_org_access(user_id, org_id)
 
     key = f"{_app_prefix(org_id, agent_id, task_id, app_name)}/index.html"
     try:
@@ -46,35 +77,53 @@ async def serve_app(
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"App '{app_name}' not found: {e}")
 
-    # Inject Parasync app SDK before </head>
+    # Use absolute backend URL so iframe fetch calls work cross-origin
+    api_origin = BACKEND or ""
+
     sdk = f"""<script>
 window.__APP__ = {{
   agentId: "{agent_id}", taskId: "{task_id}", appName: "{app_name}",
-  _h: () => ({{
-    "Content-Type": "application/json",
-    "Authorization": "Bearer " + (localStorage.getItem("sb-access-token") || "")
-  }}),
+  _token: "",
+  _h() {{
+    return {{
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + (this._token || localStorage.getItem("sb-access-token") || "")
+    }};
+  }},
   async data(key) {{
-    const r = await fetch(`/app/{agent_id}/{task_id}/{app_name}/data/${{key}}`, {{ headers: this._h() }});
+    const r = await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/data/" + key, {{ headers: this._h() }});
     if (!r.ok) return null;
     return r.json();
   }},
   async setData(key, value) {{
-    await fetch(`/app/{agent_id}/{task_id}/{app_name}/data/${{key}}`, {{
+    await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/data/" + key, {{
       method: "POST", headers: this._h(), body: JSON.stringify(value)
     }});
   }},
   async run(script, params={{}}) {{
-    const r = await fetch(`/app/{agent_id}/{task_id}/{app_name}/run/${{script}}`, {{
+    const r = await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/run/" + script, {{
       method: "POST", headers: this._h(), body: JSON.stringify({{ params }})
     }});
     return r.json();
+  }},
+  async listData() {{
+    const r = await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/files", {{ headers: this._h() }});
+    return r.ok ? r.json() : [];
   }}
 }};
+// Allow parent window to inject the auth token
+window.addEventListener("message", (e) => {{
+  if (e.data && e.data.type === "PARASYNC_TOKEN") {{
+    window.__APP__._token = e.data.token;
+  }}
+}});
 </script>"""
 
     html = html.replace("</head>", sdk + "\n</head>") if "</head>" in html else sdk + html
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=html, headers={
+        "X-Frame-Options": "SAMEORIGIN",
+        "Content-Security-Policy": "frame-ancestors 'self'",
+    })
 
 
 # ── GET /app/{agent_id}/{task_id}/{app_name}/data/{key} → read ───────────────
@@ -83,9 +132,10 @@ async def read_data(
     agent_id: str, task_id: str, app_name: str, key: str,
     authorization: str | None = Header(default=None),
 ):
-    _verify(authorization)
-    task   = _resolve_task(agent_id, task_id)
-    org_id = task["org_id"]
+    user_id = _verify(authorization)
+    task    = _resolve_task(agent_id, task_id)
+    org_id  = task["org_id"]
+    _check_org_access(user_id, org_id)
 
     storage_key = f"{_app_prefix(org_id, agent_id, task_id, app_name)}/{key}"
     try:
@@ -105,9 +155,10 @@ async def write_data(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
-    _verify(authorization)
-    task   = _resolve_task(agent_id, task_id)
-    org_id = task["org_id"]
+    user_id = _verify(authorization)
+    task    = _resolve_task(agent_id, task_id)
+    org_id  = task["org_id"]
+    _check_org_access(user_id, org_id)
 
     body    = await request.json()
     content = json.dumps(body, indent=2).encode("utf-8")
@@ -130,19 +181,19 @@ async def run_script(
     body: RunPayload,
     authorization: str | None = Header(default=None),
 ):
-    _verify(authorization)
-    task   = _resolve_task(agent_id, task_id)
-    org_id = task["org_id"]
+    user_id = _verify(authorization)
+    task    = _resolve_task(agent_id, task_id)
+    org_id  = task["org_id"]
+    _check_org_access(user_id, org_id)
 
     app_prefix = _app_prefix(org_id, agent_id, task_id, app_name)
 
-    # Download script
     try:
         script_content = supabase.storage.from_(BUCKET).download(f"{app_prefix}/{script}").decode("utf-8")
     except Exception:
         raise HTTPException(status_code=404, detail=f"Script '{script}' not found")
 
-    # Download data files into workspace
+    # Download all JSON data files into sandbox workspace
     files: dict[str, bytes] = {}
     try:
         listed = supabase.storage.from_(BUCKET).list(app_prefix)
@@ -156,7 +207,6 @@ async def run_script(
     except Exception:
         pass
 
-    # Fetch agent secrets
     from executor import fetch_agent_secrets
     agent_secrets = await fetch_agent_secrets(agent_id)
 
@@ -179,7 +229,6 @@ async def run_script(
         timeout=60,
     )
 
-    # Push output files back to storage
     import base64
     for filename, b64 in result.get("output_files", {}).items():
         fkey = f"{app_prefix}/{filename}"
@@ -204,15 +253,35 @@ async def run_script(
     }
 
 
+# ── GET /app/{agent_id}/{task_id}/{app_name}/files → list data files ──────────
+@router.get("/{agent_id}/{task_id}/{app_name}/files")
+async def list_files(
+    agent_id: str, task_id: str, app_name: str,
+    authorization: str | None = Header(default=None),
+):
+    user_id = _verify(authorization)
+    task    = _resolve_task(agent_id, task_id)
+    org_id  = task["org_id"]
+    _check_org_access(user_id, org_id)
+
+    app_prefix = _app_prefix(org_id, agent_id, task_id, app_name)
+    try:
+        items = supabase.storage.from_(BUCKET).list(app_prefix)
+        return [i["name"] for i in (items or []) if i.get("name")]
+    except Exception:
+        return []
+
+
 # ── GET /app/{agent_id}/{task_id}/apps → list all apps ───────────────────────
 @router.get("/{agent_id}/{task_id}/apps")
 async def list_apps(
     agent_id: str, task_id: str,
     authorization: str | None = Header(default=None),
 ):
-    _verify(authorization)
-    task   = _resolve_task(agent_id, task_id)
-    org_id = task["org_id"]
+    user_id = _verify(authorization)
+    task    = _resolve_task(agent_id, task_id)
+    org_id  = task["org_id"]
+    _check_org_access(user_id, org_id)
 
     prefix = f"{_storage_prefix(org_id, agent_id, task_id)}/apps"
     try:

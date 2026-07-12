@@ -2,7 +2,7 @@
 
 import json
 import asyncio
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any
 from pathlib import Path
@@ -18,6 +18,7 @@ from memory_manager import (
 from workspace_manager import get_task_md
 from web_search import run_web_search
 from browser_client import run_in_browser
+from app_context import get_apps_md, build_app_context_block
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -162,14 +163,8 @@ WEB_SEARCH_TOOL_DEF = {
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {
-                "type": "string",
-                "description": "The search query.",
-            },
-            "count": {
-                "type": "integer",
-                "description": "Number of results to return (1-10). Default: 5.",
-            },
+            "query": {"type": "string", "description": "The search query."},
+            "count": {"type": "integer", "description": "Number of results (1-10). Default: 5."},
         },
         "required": ["query"],
     },
@@ -179,26 +174,15 @@ BROWSE_WEB_TOOL_DEF = {
     "name": "browse_web",
     "description": (
         "Browse the web using a full AI-powered browser. "
-        "Can navigate pages, click buttons, fill forms, and extract content from any website "
-        "including JavaScript-rendered pages and sites behind Cloudflare. "
-        "Use this when web_search results are not enough and you need to actually visit and interact with a page. "
-        "Slower than web_search — prefer web_search for simple lookups."
+        "Can navigate pages, click buttons, fill forms, and extract content from any website. "
+        "Use when web_search results are not enough. Slower than web_search."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "task": {
-                "type": "string",
-                "description": "Natural language instruction describing what to do in the browser.",
-            },
-            "start_url": {
-                "type": "string",
-                "description": "Optional URL to start from. If not provided the agent will navigate on its own.",
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Max seconds to run the browser task. Default: 120.",
-            },
+            "task":      {"type": "string", "description": "Natural language instruction for the browser."},
+            "start_url": {"type": "string", "description": "Optional starting URL."},
+            "timeout":   {"type": "integer", "description": "Max seconds. Default: 120."},
         },
         "required": ["task"],
     },
@@ -210,7 +194,7 @@ def handle_create_task(agent_id: str, org_id: str, name: str, instruction: str) 
     owner_id = org_res.data[0]["owner_id"] if org_res.data else None
     if not owner_id:
         return "Could not create task: unable to resolve org owner."
-    res  = supabase.from_("tasks").insert({
+    res = supabase.from_("tasks").insert({
         "agent_id":     agent_id,
         "org_id":       org_id,
         "created_by":   owner_id,
@@ -273,8 +257,11 @@ def build_chat_system_prompt(
     contexts: list[dict],
     memory: dict[str, str],
     task_md: str,
+    apps_md: str,
     resolved_task_id: str | None,
     agent_secret_keys: list[str],
+    agent_id: str = "",
+    task_id: str = "",
 ) -> str:
     parts = [agent["system_prompt"].strip()]
 
@@ -288,6 +275,14 @@ def build_chat_system_prompt(
     if task_md and resolved_task_id:
         parts.append(f"\n\n== ACTIVE TASK CONTEXT ==\n{task_md}")
 
+    # App builder context — always injected so agent knows what it can build
+    parts.append(f"\n\n{build_app_context_block(apps_md)}")
+    if agent_id and task_id:
+        parts.append(
+            f"\nWhen you build an app, tell the user the URL is: "
+            f"/apps/{agent_id}/{task_id}/{{app-name}}"
+        )
+
     if agent_secret_keys:
         parts.append("\n\n== AVAILABLE SECRETS ==")
         parts.append("Available as env vars in execute_code sandbox via os.environ['KEY_NAME']:")
@@ -300,10 +295,10 @@ def build_chat_system_prompt(
         "- Execute code in a sandbox (execute_code — if enabled)\n"
         "- Search the web for current information (web_search — if enabled)\n"
         "- Browse the web with a full browser agent (browse_web — if enabled)\n"
+        "- Build interactive web apps (write to /workspace/apps/{name}/ via execute_code)\n"
         "- Create and run tasks (create_task, run_task, list_tasks)\n"
         "- Search past conversations (search_history)\n"
         "- Update your persistent memory (memory)\n"
-        "When writing files via execute_code, they are persisted in your task workspace automatically.\n"
         "Always use list_tasks to get full task UUIDs before calling run_task.\n"
         "Always update your AGENT.md memory with important facts you discover."
     )
@@ -377,13 +372,19 @@ async def chat(agent_id: str, body: ChatRequest):
     if resolved_task_id:
         task_md = get_task_md(body.org_id, agent_id, resolved_task_id)
 
+    # Load APPS.md for app registry context
+    apps_md = get_apps_md(body.org_id, agent_id, resolved_task_id) if resolved_task_id else ""
+
     system_prompt = build_chat_system_prompt(
         agent=agent,
         contexts=contexts,
         memory=memory,
         task_md=task_md,
+        apps_md=apps_md,
         resolved_task_id=resolved_task_id,
         agent_secret_keys=list(agent_secrets.keys()),
+        agent_id=agent_id,
+        task_id=resolved_task_id or "",
     )
 
     tool_map    = {t["name"]: t for t in tools}
@@ -518,9 +519,7 @@ async def chat(agent_id: str, body: ChatRequest):
                 if result["ok"]:
                     steps_summary = ", ".join(result.get("steps", [])[:5])
                     result_content = (
-                        f"Browser task completed.\n"
-                        f"Steps taken: {steps_summary}\n\n"
-                        f"Result:\n{result['result']}"
+                        f"Browser task completed.\nSteps: {steps_summary}\n\nResult:\n{result['result']}"
                     )
                 else:
                     result_content = f"Browser task failed: {result.get('error', 'Unknown error')}"
