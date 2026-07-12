@@ -17,44 +17,50 @@ def get_apps_md(org_id: str, agent_id: str, task_id: str) -> str:
         return ""
 
 
-APP_BUILDER_INSTRUCTIONS = """
-══ AGENT APP BUILDER ══
-You can build interactive web apps that run inside the Parasync platform.
+APP_BUILDER_INSTRUCTIONS = (
+    "\n\u2550\u2550 AGENT APP BUILDER \u2550\u2550\n"
+    "You can build interactive web apps that run inside the Parasync platform.\n\n"
 
-HOW TO BUILD AN APP:
-1. Write files to /workspace/apps/{app-name}/
-   - index.html   → the frontend (HTML + CSS + JS, all inline)
-   - update.py    → backend script(s) the frontend can trigger
-   - data.json    → initial data / database seed
+    "CRITICAL RULES - FOLLOW EXACTLY:\n"
+    "1. ALL app files MUST go inside /workspace/apps/{app-name}/ - never in /workspace/ root\n"
+    "2. Every app needs exactly these 3 files:\n"
+    "   - /workspace/apps/{app-name}/index.html  -> full frontend (HTML+CSS+JS inline)\n"
+    "   - /workspace/apps/{app-name}/update.py   -> backend Python script\n"
+    "   - /workspace/apps/{app-name}/data.json   -> initial seed data\n\n"
 
-2. The frontend has access to window.__APP__ SDK:
-   - await __APP__.data("data.json")              → read a data file
-   - await __APP__.setData("data.json", payload)  → write a data file  
-   - await __APP__.run("update.py", {params})     → execute a Python script
-     The script runs in sandbox, can read/write .json files, returns stdout as JSON.
+    "HOW TO BUILD - STEP BY STEP:\n"
+    "Step 1: Write index.html to /workspace/apps/{app-name}/index.html\n"
+    "Step 2: Write update.py to /workspace/apps/{app-name}/update.py\n"
+    "Step 3: Write data.json to /workspace/apps/{app-name}/data.json\n"
+    "Step 4: Update /workspace/APPS.md with the app entry\n"
+    "Step 5: Tell user the exact full URL (provided below)\n\n"
 
-3. After building, update /workspace/APPS.md:
-   ## Apps
-   - {app-name} | {description} | files: index.html, update.py, data.json
+    "EXAMPLE PYTHON CODE to write files correctly:\n"
+    "    import os, json, pathlib\n"
+    "    app_dir = pathlib.Path('/workspace/apps/my-app')\n"
+    "    app_dir.mkdir(parents=True, exist_ok=True)\n"
+    "    (app_dir / 'index.html').write_text('<!DOCTYPE html><html>...</html>')\n"
+    "    (app_dir / 'update.py').write_text('import json\\nprint(json.dumps({\"status\": \"updated\"}))')\n"
+    "    (app_dir / 'data.json').write_text(json.dumps([{'key': 'value'}]))\n"
+    "    print('Files:', os.listdir(app_dir))  # always verify\n\n"
 
-4. Tell the user: "Your app is ready. Open it at /apps/{agent_id}/{task_id}/{app-name}"
+    "FRONTEND SDK - window.__APP__ is injected automatically:\n"
+    "    await __APP__.data('data.json')              -> read data file\n"
+    "    await __APP__.setData('data.json', value)    -> write data file\n"
+    "    await __APP__.run('update.py', {params})     -> run Python script\n\n"
 
-RULES FOR BUILDING APPS:
-- Keep all HTML/CSS/JS in index.html (no external CDN dependencies unless necessary)
-- Python scripts must print a JSON object to stdout as their final output
-- Python scripts can read data files from the current directory (they're passed as workspace files)
-- Python scripts write output files to the current directory — they get pushed back to storage automatically
-- Agent secrets are available in Python scripts via os.environ['KEY_NAME']
-- Always seed data.json with realistic initial data so the app works immediately
+    "PYTHON SCRIPT RULES:\n"
+    "- Must print a JSON object to stdout: print(json.dumps({...}))\n"
+    "- Read/write data files using relative paths e.g. open('data.json')\n"
+    "- Agent secrets available via os.environ['KEY_NAME']\n\n"
 
-EXAMPLE — price simulator:
-/workspace/apps/price-sim/index.html  → Chart.js chart, refresh button calls __APP__.run("update.py")
-/workspace/apps/price-sim/update.py  → generates new OHLC data, writes data.json, prints {"status": "updated"}  
-/workspace/apps/price-sim/data.json  → [{"t": "...", "o": 100, "h": 105, "l": 98, "c": 103}, ...]
-"""
+    "ALWAYS verify files were written by listing the directory:\n"
+    "    import os\n"
+    "    print(os.listdir('/workspace/apps/my-app'))\n"
+)
 
 
 def build_app_context_block(apps_md: str) -> str:
     if not apps_md:
-        return APP_BUILDER_INSTRUCTIONS + "\n\nNo apps built yet for this task."
-    return APP_BUILDER_INSTRUCTIONS + f"\n\n══ EXISTING APPS ══\n{apps_md}"
+        return APP_BUILDER_INSTRUCTIONS + "\nNo apps built yet for this task."
+    return APP_BUILDER_INSTRUCTIONS + f"\n\n\u2550\u2550 EXISTING APPS \u2550\u2550\n{apps_md}"
