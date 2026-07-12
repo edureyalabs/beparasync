@@ -15,6 +15,7 @@ from memory_manager import get_memory, build_memory_block, MEMORY_TOOL_DEF, appl
 from workspace_manager import pull_workspace, push_workspace, snapshot_hashes, get_task_md
 from web_search import run_web_search
 from browser_client import run_in_browser
+from app_context import get_apps_md, build_app_context_block
 
 
 def now_iso() -> str:
@@ -68,13 +69,6 @@ def load_agent_platform_tools(agent_id: str) -> set[str]:
     return {r["platform_tool_key"] for r in (res.data or [])}
 
 
-def push_file_to_storage(storage_path: str, content: bytes, mime_type: str = "application/octet-stream"):
-    supabase.storage.from_("agent-files").upload(
-        path=storage_path, file=content,
-        file_options={"content-type": mime_type, "upsert": "true"},
-    )
-
-
 def write_execution_log(run_id: str, stdout: str, stderr: str, exit_code: int, duration_ms: int):
     if not run_id:
         return
@@ -97,7 +91,10 @@ def build_system_prompt(
     memory: dict[str, str],
     agent_secret_keys: list[str],
     task_md: str,
+    apps_md: str,
     task: dict,
+    agent_id: str,
+    task_id: str,
 ) -> str:
     parts = [agent["system_prompt"].strip()]
 
@@ -127,6 +124,13 @@ def build_system_prompt(
             "the file structure, how to run it, and what remains to be done."
         )
 
+    # App builder context
+    parts.append(f"\n\n{build_app_context_block(apps_md)}")
+    parts.append(
+        f"\nWhen you build an app, tell the user the URL is: "
+        f"/apps/{agent_id}/{task_id}/{{app-name}}"
+    )
+
     if agent_secret_keys:
         parts.append("\n\n══ AVAILABLE SECRETS ══")
         parts.append("Available as env vars via os.environ['KEY_NAME']:")
@@ -142,7 +146,8 @@ SANDBOX_TOOL_DEF = {
         "Execute Python code in a secure sandbox with access to your task workspace at /workspace/. "
         "Files you create or modify persist between runs. "
         "Agent secrets available via os.environ['KEY_NAME']. "
-        "Print results to stdout. Write files to /workspace/ to persist them."
+        "Print results to stdout. Write files to /workspace/ to persist them. "
+        "To build an app, write files to /workspace/apps/{app-name}/index.html, update.py, data.json"
     ),
     "parameters": {
         "type": "object",
@@ -164,14 +169,8 @@ WEB_SEARCH_TOOL_DEF = {
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {
-                "type": "string",
-                "description": "The search query.",
-            },
-            "count": {
-                "type": "integer",
-                "description": "Number of results to return (1-10). Default: 5.",
-            },
+            "query": {"type": "string", "description": "The search query."},
+            "count": {"type": "integer", "description": "Number of results (1-10). Default: 5."},
         },
         "required": ["query"],
     },
@@ -181,26 +180,15 @@ BROWSE_WEB_TOOL_DEF = {
     "name": "browse_web",
     "description": (
         "Browse the web using a full AI-powered browser. "
-        "Can navigate pages, click buttons, fill forms, and extract content from any website "
-        "including JavaScript-rendered pages and sites behind Cloudflare. "
-        "Use this when web_search results are not enough and you need to actually visit and interact with a page. "
-        "Slower than web_search — prefer web_search for simple lookups."
+        "Can navigate pages, click buttons, fill forms, and extract content from any website. "
+        "Use when web_search results are not enough. Slower than web_search."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "task": {
-                "type": "string",
-                "description": "Natural language instruction describing what to do in the browser.",
-            },
-            "start_url": {
-                "type": "string",
-                "description": "Optional URL to start from. If not provided the agent will navigate on its own.",
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Max seconds to run the browser task. Default: 120.",
-            },
+            "task":      {"type": "string", "description": "Natural language instruction for the browser."},
+            "start_url": {"type": "string", "description": "Optional starting URL."},
+            "timeout":   {"type": "integer", "description": "Max seconds. Default: 120."},
         },
         "required": ["task"],
     },
@@ -305,10 +293,14 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
         if task_md_path.exists():
             task_md = task_md_path.read_text(encoding="utf-8")
 
+        # Load APPS.md for app registry context
+        apps_md = get_apps_md(org_id, agent_id, task_id)
+
         system_prompt = build_system_prompt(
             agent=agent, contexts=contexts, memory=memory,
             agent_secret_keys=list(agent_secrets.keys()),
-            task_md=task_md, task=task,
+            task_md=task_md, apps_md=apps_md,
+            task=task, agent_id=agent_id, task_id=task_id,
         )
 
         tool_defs = build_tool_definitions(tools) + [MEMORY_TOOL_DEF]
@@ -417,9 +409,7 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
                     if result["ok"]:
                         steps_summary = ", ".join(result.get("steps", [])[:5])
                         tool_result_content = (
-                            f"Browser task completed.\n"
-                            f"Steps taken: {steps_summary}\n\n"
-                            f"Result:\n{result['result']}"
+                            f"Browser task completed.\nSteps: {steps_summary}\n\nResult:\n{result['result']}"
                         )
                     else:
                         tool_result_content = f"Browser task failed: {result.get('error', 'Unknown error')}"

@@ -11,10 +11,11 @@ from routes.files        import router as files_router
 from routes.environments import router as environments_router
 from routes.agent_config import router as agent_config_router
 from routes.chat         import router as chat_router
+from routes.app          import router as app_router
 
 load_dotenv()
 
-app = FastAPI(title="parasync backend", version="0.4.0")
+app = FastAPI(title="parasync backend", version="0.5.0")
 
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
 origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -45,6 +46,7 @@ app.include_router(files_router)
 app.include_router(environments_router)
 app.include_router(agent_config_router)
 app.include_router(chat_router)
+app.include_router(app_router)
 
 
 @app.get("/health")
