@@ -481,24 +481,39 @@ async def chat(agent_id: str, body: ChatRequest):
 
             elif tool_name == "execute_code":
                 from agent_runner import handle_sandbox_tool_call
+                from workspace_manager import pull_workspace, push_workspace, snapshot_hashes
+                import shutil
+
                 environment = {}
                 env_res = supabase.from_("agent_environments").select("*").eq("agent_id", agent_id).execute()
                 if env_res.data:
                     environment = env_res.data[0]
 
                 workspace_dir = Path(tempfile.mkdtemp())
-                result_content, _ = await handle_sandbox_tool_call(
-                    call=call,
-                    run_id=None,
-                    task_id=resolved_task_id or agent_id,
-                    agent_id=agent_id,
-                    org_id=body.org_id,
-                    all_secrets=all_secrets,
-                    agent_secrets=agent_secrets,
-                    environment=environment,
-                    workspace_dir=workspace_dir,
-                    steps=[],
-                )
+                try:
+                    # Pull existing workspace so agent has context of previous files
+                    if resolved_task_id:
+                        pull_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir)
+                    pre_hashes = snapshot_hashes(workspace_dir)
+
+                    result_content, _ = await handle_sandbox_tool_call(
+                        call=call,
+                        run_id=None,
+                        task_id=resolved_task_id or agent_id,
+                        agent_id=agent_id,
+                        org_id=body.org_id,
+                        all_secrets=all_secrets,
+                        agent_secrets=agent_secrets,
+                        environment=environment,
+                        workspace_dir=workspace_dir,
+                        steps=[],
+                    )
+
+                    # Push new/changed files back to storage
+                    if resolved_task_id:
+                        push_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir, pre_hashes)
+                finally:
+                    shutil.rmtree(workspace_dir, ignore_errors=True)
 
             elif tool_name == "web_search":
                 query = tool_args.get("query", "")
