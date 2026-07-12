@@ -2,11 +2,13 @@
 
 import json
 import asyncio
-from fastapi import APIRouter, HTTPException
+import shutil
+from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Any
 from pathlib import Path
 import tempfile
+import os
 
 from db import supabase
 from llm.factory import get_llm_client
@@ -15,7 +17,7 @@ from memory_manager import (
     get_memory, build_memory_block, apply_memory_action,
     MEMORY_TOOL_DEF, SEARCH_HISTORY_TOOL_DEF,
 )
-from workspace_manager import get_task_md
+from workspace_manager import get_task_md, pull_workspace, push_workspace, snapshot_hashes
 from web_search import run_web_search
 from browser_client import run_in_browser
 from app_context import get_apps_md, build_app_context_block
@@ -23,6 +25,7 @@ from app_context import get_apps_md, build_app_context_block
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 RECENT_MSG_COUNT = 20
+FRONTEND_URL = os.getenv("FRONTEND_URL", "")  # e.g. https://parasync.vercel.app
 
 
 class ChatRequest(BaseModel):
@@ -157,8 +160,7 @@ WEB_SEARCH_TOOL_DEF = {
     "name": "web_search",
     "description": (
         "Search the web for current information. "
-        "Returns titles, URLs, and descriptions of the top results. "
-        "Use this when you need up-to-date information, facts, or URLs."
+        "Returns titles, URLs, and descriptions of the top results."
     ),
     "parameters": {
         "type": "object",
@@ -174,8 +176,8 @@ BROWSE_WEB_TOOL_DEF = {
     "name": "browse_web",
     "description": (
         "Browse the web using a full AI-powered browser. "
-        "Can navigate pages, click buttons, fill forms, and extract content from any website. "
-        "Use when web_search results are not enough. Slower than web_search."
+        "Can navigate pages, click buttons, fill forms, and extract content. "
+        "Use when web_search is not enough. Slower than web_search."
     ),
     "parameters": {
         "type": "object",
@@ -275,12 +277,17 @@ def build_chat_system_prompt(
     if task_md and resolved_task_id:
         parts.append(f"\n\n== ACTIVE TASK CONTEXT ==\n{task_md}")
 
-    # App builder context — always injected so agent knows what it can build
+    # App builder context
     parts.append(f"\n\n{build_app_context_block(apps_md)}")
+
+    # Always inject the exact app URL format so agent gives correct links
+    frontend = FRONTEND_URL.rstrip("/")
     if agent_id and task_id:
         parts.append(
-            f"\nWhen you build an app, tell the user the URL is: "
-            f"/apps/{agent_id}/{task_id}/{{app-name}}"
+            f"\n\n== APP URLS ==\n"
+            f"When you build an app named {{app-name}}, tell the user the EXACT shareable URL:\n"
+            f"{frontend}/apps/{agent_id}/{task_id}/{{app-name}}\n"
+            f"Always use this full URL. Never use a partial path like /apps/app-name."
         )
 
     if agent_secret_keys:
@@ -291,16 +298,14 @@ def build_chat_system_prompt(
 
     parts.append(
         "\n\n== CAPABILITIES ==\n"
-        "You can use tools to:\n"
         "- Execute code in a sandbox (execute_code — if enabled)\n"
-        "- Search the web for current information (web_search — if enabled)\n"
-        "- Browse the web with a full browser agent (browse_web — if enabled)\n"
+        "- Search the web (web_search — if enabled)\n"
+        "- Browse the web with a full browser (browse_web — if enabled)\n"
         "- Build interactive web apps (write to /workspace/apps/{name}/ via execute_code)\n"
         "- Create and run tasks (create_task, run_task, list_tasks)\n"
         "- Search past conversations (search_history)\n"
-        "- Update your persistent memory (memory)\n"
-        "Always use list_tasks to get full task UUIDs before calling run_task.\n"
-        "Always update your AGENT.md memory with important facts you discover."
+        "- Update persistent memory (memory)\n"
+        "Always use list_tasks to get full task UUIDs before calling run_task."
     )
 
     return "\n".join(parts)
@@ -318,7 +323,6 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
     for msg in recent_messages:
         if msg["role"] == "user":
             messages.append({"role": "user", "content": msg["content"] or ""})
-
         elif msg["role"] == "assistant":
             if msg.get("tool_calls"):
                 normalized = []
@@ -329,28 +333,18 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
                     if not tc_name or tc_id not in covered:
                         continue
                     normalized.append({
-                        "id":       tc_id,
-                        "type":     "function",
+                        "id": tc_id, "type": "function",
                         "function": {"name": tc_name, "arguments": tc_args},
                     })
                 if normalized:
-                    messages.append({
-                        "role":       "assistant",
-                        "content":    None,
-                        "tool_calls": normalized,
-                    })
+                    messages.append({"role": "assistant", "content": None, "tool_calls": normalized})
             else:
                 messages.append({"role": "assistant", "content": msg["content"] or ""})
-
         elif msg["role"] == "tool":
             tool_call_id = (msg.get("meta") or {}).get("tool_call_id")
             if not tool_call_id:
                 continue
-            messages.append({
-                "role":         "tool",
-                "tool_call_id": tool_call_id,
-                "content":      msg["content"] or "",
-            })
+            messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": msg["content"] or ""})
 
     messages.append({"role": "user", "content": user_message})
     return messages
@@ -372,7 +366,6 @@ async def chat(agent_id: str, body: ChatRequest):
     if resolved_task_id:
         task_md = get_task_md(body.org_id, agent_id, resolved_task_id)
 
-    # Load APPS.md for app registry context
     apps_md = get_apps_md(body.org_id, agent_id, resolved_task_id) if resolved_task_id else ""
 
     system_prompt = build_chat_system_prompt(
@@ -402,10 +395,8 @@ async def chat(agent_id: str, body: ChatRequest):
     if "execute_code" in platform_tools:
         from agent_runner import SANDBOX_TOOL_DEF
         tool_defs.append(SANDBOX_TOOL_DEF)
-
     if "web_search" in platform_tools:
         tool_defs.append(WEB_SEARCH_TOOL_DEF)
-
     if "browse_web" in platform_tools:
         tool_defs.append(BROWSE_WEB_TOOL_DEF)
 
@@ -440,8 +431,7 @@ async def chat(agent_id: str, body: ChatRequest):
         )
 
         messages.append({
-            "role":       "assistant",
-            "content":    None,
+            "role": "assistant", "content": None,
             "tool_calls": [
                 {"id": c["id"], "type": "function",
                  "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
@@ -481,8 +471,6 @@ async def chat(agent_id: str, body: ChatRequest):
 
             elif tool_name == "execute_code":
                 from agent_runner import handle_sandbox_tool_call
-                from workspace_manager import pull_workspace, push_workspace, snapshot_hashes
-                import shutil
 
                 environment = {}
                 env_res = supabase.from_("agent_environments").select("*").eq("agent_id", agent_id).execute()
@@ -491,7 +479,7 @@ async def chat(agent_id: str, body: ChatRequest):
 
                 workspace_dir = Path(tempfile.mkdtemp())
                 try:
-                    # Pull existing workspace so agent has context of previous files
+                    # Pull existing workspace so agent has all previous files
                     if resolved_task_id:
                         pull_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir)
                     pre_hashes = snapshot_hashes(workspace_dir)
@@ -509,16 +497,17 @@ async def chat(agent_id: str, body: ChatRequest):
                         steps=[],
                     )
 
-                    # Push new/changed files back to storage
+                    # Push new/changed files back to storage — this is what was missing
                     if resolved_task_id:
                         push_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir, pre_hashes)
+
                 finally:
                     shutil.rmtree(workspace_dir, ignore_errors=True)
 
             elif tool_name == "web_search":
-                query = tool_args.get("query", "")
-                count = tool_args.get("count", 5)
-                result_content = await run_web_search(query, count)
+                result_content = await run_web_search(
+                    tool_args.get("query", ""), tool_args.get("count", 5)
+                )
 
             elif tool_name == "browse_web":
                 flat_secrets: dict[str, str] = {}
@@ -533,9 +522,7 @@ async def chat(agent_id: str, body: ChatRequest):
                 )
                 if result["ok"]:
                     steps_summary = ", ".join(result.get("steps", [])[:5])
-                    result_content = (
-                        f"Browser task completed.\nSteps: {steps_summary}\n\nResult:\n{result['result']}"
-                    )
+                    result_content = f"Browser task completed.\nSteps: {steps_summary}\n\nResult:\n{result['result']}"
                 else:
                     result_content = f"Browser task failed: {result.get('error', 'Unknown error')}"
 
@@ -554,12 +541,7 @@ async def chat(agent_id: str, body: ChatRequest):
                 tool_name=tool_name, task_id=resolved_task_id,
                 meta={"tool_call_id": call["id"]},
             )
-
-            messages.append({
-                "role":         "tool",
-                "tool_call_id": call["id"],
-                "content":      result_content,
-            })
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": result_content})
 
     return {"response": final_response, "iterations": iteration}
 
