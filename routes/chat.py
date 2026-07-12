@@ -74,7 +74,7 @@ def load_recent_messages(agent_id: str, limit: int = RECENT_MSG_COUNT) -> list[d
     return list(reversed(res.data or []))
 
 
-def resolve_task_id(agent_id: str, active_task_id: str | None) -> str | None:
+def resolve_task_id(agent_id: str, active_task_id: str | None, org_id: str = "") -> str | None:
     if active_task_id:
         return active_task_id
     res = (
@@ -86,7 +86,26 @@ def resolve_task_id(agent_id: str, active_task_id: str | None) -> str | None:
         .limit(1)
         .execute()
     )
-    return res.data[0]["id"] if res.data else None
+    if res.data:
+        return res.data[0]["id"]
+
+    # No active task — auto-create a default chat workspace task
+    if not org_id:
+        return None
+    org_res  = supabase.from_("organizations").select("owner_id").eq("id", org_id).execute()
+    owner_id = org_res.data[0]["owner_id"] if org_res.data else None
+    if not owner_id:
+        return None
+    new_task = supabase.from_("tasks").insert({
+        "agent_id":     agent_id,
+        "org_id":       org_id,
+        "created_by":   owner_id,
+        "name":         "Chat Workspace",
+        "instruction":  "Default workspace for app building and code execution via chat.",
+        "trigger_type": "manual",
+        "is_active":    True,
+    }).execute()
+    return new_task.data[0]["id"] if new_task.data else None
 
 
 def search_history(agent_id: str, query: str) -> str:
@@ -360,7 +379,7 @@ async def chat(agent_id: str, body: ChatRequest):
     recent_msgs    = load_recent_messages(agent_id)
     agent_secrets  = await fetch_agent_secrets(agent_id)
 
-    resolved_task_id = resolve_task_id(agent_id, body.active_task_id)
+    resolved_task_id = resolve_task_id(agent_id, body.active_task_id, body.org_id)
 
     task_md = ""
     if resolved_task_id:
@@ -497,13 +516,9 @@ async def chat(agent_id: str, body: ChatRequest):
                         steps=[],
                     )
 
-                    # Push new/changed files back to storage
+                    # Push new/changed files back to storage — this is what was missing
                     if resolved_task_id:
-                        import logging
-                        files_in_workspace = list(workspace_dir.rglob("*"))
-                        logging.warning(f"[chat] workspace files before push: {[str(f.relative_to(workspace_dir)) for f in files_in_workspace if f.is_file()]}")
                         push_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir, pre_hashes)
-                        logging.warning(f"[chat] push_workspace completed")
 
                 finally:
                     shutil.rmtree(workspace_dir, ignore_errors=True)
