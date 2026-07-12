@@ -18,6 +18,11 @@ def _hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _rel_to_storage(rel_path: str) -> str:
+    """Normalize path separators to forward slashes for Supabase Storage."""
+    return rel_path.replace("\\", "/")
+
+
 def pull_workspace(org_id: str, agent_id: str, task_id: str, local_dir: Path):
     """Pull all task workspace files from Supabase Storage into local_dir."""
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -32,7 +37,7 @@ def pull_workspace(org_id: str, agent_id: str, task_id: str, local_dir: Path):
     prefix = _storage_prefix(org_id, agent_id, task_id)
 
     for row in (res.data or []):
-        file_path  = row["file_path"]
+        file_path   = row["file_path"]
         storage_key = f"{prefix}/{file_path}"
         try:
             content = supabase.storage.from_(BUCKET).download(storage_key)
@@ -57,7 +62,8 @@ def push_workspace(
     if local_dir.exists():
         for f in local_dir.rglob("*"):
             if f.is_file():
-                rel = str(f.relative_to(local_dir))
+                # Always use forward slashes for storage keys
+                rel = _rel_to_storage(str(f.relative_to(local_dir)))
                 current_files[rel] = f.read_bytes()
 
     # Upload new/changed files
@@ -67,22 +73,31 @@ def push_workspace(
             continue  # unchanged
 
         storage_key = f"{prefix}/{rel_path}"
-        supabase.storage.from_(BUCKET).upload(
-            path=storage_key,
-            file=content,
-            file_options={"upsert": "true"},
-        )
+        print(f"[workspace] uploading: {storage_key}", flush=True)
+        try:
+            supabase.storage.from_(BUCKET).upload(
+                path=storage_key,
+                file=content,
+                file_options={"upsert": "true"},
+            )
+        except Exception as e:
+            print(f"[workspace] upload failed for {rel_path}: {e}", flush=True)
+            continue
 
-        supabase.from_("task_workspace_files").upsert({
-            "task_id":      task_id,
-            "agent_id":     agent_id,
-            "org_id":       org_id,
-            "file_path":    rel_path,
-            "size_bytes":   len(content),
-            "content_hash": file_hash,
-            "written_by":   "agent",
-            "updated_at":   "now()",
-        }, on_conflict="task_id,file_path").execute()
+        # Upsert DB record
+        try:
+            supabase.from_("task_workspace_files").upsert({
+                "task_id":      task_id,
+                "agent_id":     agent_id,
+                "org_id":       org_id,
+                "file_path":    rel_path,
+                "size_bytes":   len(content),
+                "content_hash": file_hash,
+                "written_by":   "agent",
+                "updated_at":   "now()",
+            }, on_conflict="task_id,file_path").execute()
+        except Exception as e:
+            print(f"[workspace] db upsert failed for {rel_path}: {e}", flush=True)
 
     # Delete files the agent removed
     for old_path in set(pre_run_hashes.keys()) - set(current_files.keys()):
@@ -91,7 +106,10 @@ def push_workspace(
             supabase.storage.from_(BUCKET).remove([storage_key])
         except Exception:
             pass
-        supabase.from_("task_workspace_files").delete().eq("task_id", task_id).eq("file_path", old_path).execute()
+        try:
+            supabase.from_("task_workspace_files").delete().eq("task_id", task_id).eq("file_path", old_path).execute()
+        except Exception:
+            pass
 
 
 def snapshot_hashes(local_dir: Path) -> dict[str, str]:
@@ -100,7 +118,7 @@ def snapshot_hashes(local_dir: Path) -> dict[str, str]:
     if local_dir.exists():
         for f in local_dir.rglob("*"):
             if f.is_file():
-                rel = str(f.relative_to(local_dir))
+                rel = _rel_to_storage(str(f.relative_to(local_dir)))
                 hashes[rel] = _hash(f.read_bytes())
     return hashes
 
