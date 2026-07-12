@@ -273,7 +273,7 @@ async def list_files(
 
 
 # ── GET /app/{agent_id}/{task_id}/apps → list all apps ───────────────────────
-@router.get("/{agent_id}/{task_id}/apps")
+@router.get("/{agent_id}/{task_id}/_apps")
 async def list_apps(
     agent_id: str, task_id: str,
     authorization: str | None = Header(default=None),
