@@ -498,15 +498,10 @@ async def chat(agent_id: str, body: ChatRequest):
 
                 workspace_dir = Path(tempfile.mkdtemp())
                 try:
-                    import logging
-                    logging.warning(f"[chat:execute] resolved_task_id={resolved_task_id} org_id={body.org_id} agent_id={agent_id}")
-                    
                     # Pull existing workspace so agent has all previous files
                     if resolved_task_id:
                         pull_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir)
-                    
                     pre_hashes = snapshot_hashes(workspace_dir)
-                    logging.warning(f"[chat:execute] pre_hashes keys: {list(pre_hashes.keys())}")
 
                     result_content, _ = await handle_sandbox_tool_call(
                         call=call,
@@ -521,15 +516,9 @@ async def chat(agent_id: str, body: ChatRequest):
                         steps=[],
                     )
 
-                    # Push new/changed files back to storage
-                    post_files = list(workspace_dir.rglob("*"))
-                    logging.warning(f"[chat:execute] workspace files after sandbox: {[str(f.relative_to(workspace_dir)) for f in post_files if f.is_file()]}")
-                    
+                    # Push new/changed files back to storage — this is what was missing
                     if resolved_task_id:
                         push_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir, pre_hashes)
-                        logging.warning(f"[chat:execute] push_workspace done")
-                    else:
-                        logging.warning(f"[chat:execute] SKIPPED push — no resolved_task_id")
 
                 finally:
                     shutil.rmtree(workspace_dir, ignore_errors=True)
