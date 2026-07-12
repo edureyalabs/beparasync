@@ -497,9 +497,13 @@ async def chat(agent_id: str, body: ChatRequest):
                         steps=[],
                     )
 
-                    # Push new/changed files back to storage — this is what was missing
+                    # Push new/changed files back to storage
                     if resolved_task_id:
+                        import logging
+                        files_in_workspace = list(workspace_dir.rglob("*"))
+                        logging.warning(f"[chat] workspace files before push: {[str(f.relative_to(workspace_dir)) for f in files_in_workspace if f.is_file()]}")
                         push_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir, pre_hashes)
+                        logging.warning(f"[chat] push_workspace completed")
 
                 finally:
                     shutil.rmtree(workspace_dir, ignore_errors=True)
