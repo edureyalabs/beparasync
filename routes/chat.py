@@ -25,7 +25,7 @@ from app_context import get_apps_md, build_app_context_block
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 RECENT_MSG_COUNT = 20
-FRONTEND_URL = os.getenv("FRONTEND_URL", "")  # e.g. https://parasync.vercel.app
+FRONTEND_URL = os.getenv("FRONTEND_URL", "")
 
 
 class ChatRequest(BaseModel):
@@ -89,7 +89,6 @@ def resolve_task_id(agent_id: str, active_task_id: str | None, org_id: str = "")
     if res.data:
         return res.data[0]["id"]
 
-    # No active task — auto-create a default chat workspace task
     if not org_id:
         return None
     org_res  = supabase.from_("organizations").select("owner_id").eq("id", org_id).execute()
@@ -296,10 +295,8 @@ def build_chat_system_prompt(
     if task_md and resolved_task_id:
         parts.append(f"\n\n== ACTIVE TASK CONTEXT ==\n{task_md}")
 
-    # App builder context
     parts.append(f"\n\n{build_app_context_block(apps_md)}")
 
-    # Always inject the exact app URL format so agent gives correct links
     frontend = FRONTEND_URL.rstrip("/")
     if agent_id and task_id:
         parts.append(
@@ -320,7 +317,7 @@ def build_chat_system_prompt(
         "- Execute code in a sandbox (execute_code — if enabled)\n"
         "- Search the web (web_search — if enabled)\n"
         "- Browse the web with a full browser (browse_web — if enabled)\n"
-        "- Build interactive web apps (write to /workspace/apps/{name}/ via execute_code)\n"
+        "- Build interactive web apps (write to ./apps/{name}/ via execute_code)\n"
         "- Create and run tasks (create_task, run_task, list_tasks)\n"
         "- Search past conversations (search_history)\n"
         "- Update persistent memory (memory)\n"
@@ -367,6 +364,46 @@ def build_llm_messages(recent_messages: list[dict], user_message: str) -> list[d
 
     messages.append({"role": "user", "content": user_message})
     return messages
+
+
+class _WorkspaceSession:
+    """
+    Holds a single workspace_dir open across all execute_code calls
+    within one chat turn. Eliminates the race condition where each
+    execute_code call used to create its own tempdir, causing files
+    written in call N to be invisible to call N+1.
+
+    Usage:
+        async with _WorkspaceSession(org_id, agent_id, task_id) as ws:
+            ws.dir          # Path — the local workspace directory
+            ws.pre_hashes   # dict — hashes before this turn started
+        # __aexit__ automatically pushes to storage and cleans up
+    """
+
+    def __init__(self, org_id: str, agent_id: str, task_id: str | None):
+        self.org_id   = org_id
+        self.agent_id = agent_id
+        self.task_id  = task_id
+        self.dir      = Path(tempfile.mkdtemp())
+        self.pre_hashes: dict[str, str] = {}
+
+    async def __aenter__(self):
+        if self.task_id:
+            pull_workspace(self.org_id, self.agent_id, self.task_id, self.dir)
+        self.pre_hashes = snapshot_hashes(self.dir)
+        return self
+
+    async def __aexit__(self, *_):
+        try:
+            if self.task_id:
+                push_workspace(
+                    self.org_id, self.agent_id, self.task_id,
+                    self.dir, self.pre_hashes,
+                )
+        except Exception as e:
+            print(f"[chat] push_workspace failed: {e}", flush=True)
+        finally:
+            shutil.rmtree(self.dir, ignore_errors=True)
 
 
 @router.post("/{agent_id}")
@@ -424,143 +461,168 @@ async def chat(agent_id: str, body: ChatRequest):
     llm      = get_llm_client()
     messages = build_llm_messages(recent_msgs, body.message)
 
+    # Load environment once for the whole turn
+    environment = {}
+    env_res = supabase.from_("agent_environments").select("*").eq("agent_id", agent_id).execute()
+    if env_res.data:
+        environment = env_res.data[0]
+
     MAX_ITERATIONS = 10
     iteration      = 0
     final_response = ""
 
-    while iteration < MAX_ITERATIONS:
-        iteration += 1
-        llm_result = await llm.run(system_prompt, messages, tool_defs)
+    # Single workspace session for the entire chat turn — fixes the race condition
+    # where multiple execute_code calls each pulled/pushed independently.
+    async with _WorkspaceSession(body.org_id, agent_id, resolved_task_id) as ws:
 
-        if llm_result["type"] == "text":
-            final_response = llm_result["content"]
-            save_message(agent_id, body.org_id, "assistant", final_response, task_id=resolved_task_id)
-            break
+        while iteration < MAX_ITERATIONS:
+            iteration += 1
+            llm_result = await llm.run(system_prompt, messages, tool_defs)
 
-        calls = llm_result["calls"]
+            if llm_result["type"] == "text":
+                final_response = llm_result["content"]
+                save_message(agent_id, body.org_id, "assistant", final_response, task_id=resolved_task_id)
+                break
 
-        save_message(
-            agent_id, body.org_id, "assistant",
-            tool_calls=[
-                {"id": c["id"], "type": "function",
-                 "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
-                for c in calls
-            ],
-            task_id=resolved_task_id,
-        )
-
-        messages.append({
-            "role": "assistant", "content": None,
-            "tool_calls": [
-                {"id": c["id"], "type": "function",
-                 "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
-                for c in calls
-            ],
-        })
-
-        for call in calls:
-            tool_name      = call["name"]
-            tool_args      = call["arguments"]
-            result_content = ""
-
-            if tool_name == "memory":
-                result_content = apply_memory_action(
-                    agent_id=agent_id, org_id=body.org_id,
-                    action=tool_args.get("action", ""),
-                    target=tool_args.get("target", "agent"),
-                    content=tool_args.get("content", ""),
-                    old_text=tool_args.get("old_text", ""),
-                )
-
-            elif tool_name == "search_history":
-                result_content = search_history(agent_id, tool_args.get("query", ""))
-
-            elif tool_name == "create_task":
-                result_content = handle_create_task(
-                    agent_id, body.org_id,
-                    tool_args.get("name", ""),
-                    tool_args.get("instruction", ""),
-                )
-
-            elif tool_name == "run_task":
-                result_content = handle_run_task(tool_args.get("task_id", ""), body.org_id)
-
-            elif tool_name == "list_tasks":
-                result_content = handle_list_tasks(agent_id)
-
-            elif tool_name == "execute_code":
-                from agent_runner import handle_sandbox_tool_call
-
-                environment = {}
-                env_res = supabase.from_("agent_environments").select("*").eq("agent_id", agent_id).execute()
-                if env_res.data:
-                    environment = env_res.data[0]
-
-                workspace_dir = Path(tempfile.mkdtemp())
-                try:
-                    # Pull existing workspace so agent has all previous files
-                    if resolved_task_id:
-                        pull_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir)
-                    pre_hashes = snapshot_hashes(workspace_dir)
-
-                    result_content, _ = await handle_sandbox_tool_call(
-                        call=call,
-                        run_id=None,
-                        task_id=resolved_task_id or agent_id,
-                        agent_id=agent_id,
-                        org_id=body.org_id,
-                        all_secrets=all_secrets,
-                        agent_secrets=agent_secrets,
-                        environment=environment,
-                        workspace_dir=workspace_dir,
-                        steps=[],
-                    )
-
-                    # Push new/changed files back to storage — this is what was missing
-                    if resolved_task_id:
-                        push_workspace(body.org_id, agent_id, resolved_task_id, workspace_dir, pre_hashes)
-
-                finally:
-                    shutil.rmtree(workspace_dir, ignore_errors=True)
-
-            elif tool_name == "web_search":
-                result_content = await run_web_search(
-                    tool_args.get("query", ""), tool_args.get("count", 5)
-                )
-
-            elif tool_name == "browse_web":
-                flat_secrets: dict[str, str] = {}
-                for d in all_secrets.values():
-                    flat_secrets.update(d)
-                flat_secrets.update(agent_secrets)
-                result = await run_in_browser(
-                    task=tool_args.get("task", ""),
-                    start_url=tool_args.get("start_url"),
-                    env_vars=flat_secrets,
-                    timeout=tool_args.get("timeout", 120),
-                )
-                if result["ok"]:
-                    steps_summary = ", ".join(result.get("steps", [])[:5])
-                    result_content = f"Browser task completed.\nSteps: {steps_summary}\n\nResult:\n{result['result']}"
-                else:
-                    result_content = f"Browser task failed: {result.get('error', 'Unknown error')}"
-
-            else:
-                tool = tool_map.get(tool_name)
-                if not tool:
-                    result_content = f"Tool '{tool_name}' not found."
-                else:
-                    secrets   = all_secrets.get(tool["toolset_id"], {})
-                    full_code = build_full_code(tool["name"], tool["parameters"], tool["code"])
-                    res       = await run_tool(full_code, tool["name"], tool_args, secrets)
-                    result_content = json.dumps(res["result"]) if res["ok"] else f"Error: {res['error']}"
+            calls = llm_result["calls"]
 
             save_message(
-                agent_id, body.org_id, "tool", result_content,
-                tool_name=tool_name, task_id=resolved_task_id,
-                meta={"tool_call_id": call["id"]},
+                agent_id, body.org_id, "assistant",
+                tool_calls=[
+                    {"id": c["id"], "type": "function",
+                     "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
+                    for c in calls
+                ],
+                task_id=resolved_task_id,
             )
-            messages.append({"role": "tool", "tool_call_id": call["id"], "content": result_content})
+
+            messages.append({
+                "role": "assistant", "content": None,
+                "tool_calls": [
+                    {"id": c["id"], "type": "function",
+                     "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
+                    for c in calls
+                ],
+            })
+
+            for call in calls:
+                tool_name      = call["name"]
+                tool_args      = call["arguments"]
+                result_content = ""
+
+                if tool_name == "memory":
+                    result_content = apply_memory_action(
+                        agent_id=agent_id, org_id=body.org_id,
+                        action=tool_args.get("action", ""),
+                        target=tool_args.get("target", "agent"),
+                        content=tool_args.get("content", ""),
+                        old_text=tool_args.get("old_text", ""),
+                    )
+
+                elif tool_name == "search_history":
+                    result_content = search_history(agent_id, tool_args.get("query", ""))
+
+                elif tool_name == "create_task":
+                    result_content = handle_create_task(
+                        agent_id, body.org_id,
+                        tool_args.get("name", ""),
+                        tool_args.get("instruction", ""),
+                    )
+
+                elif tool_name == "run_task":
+                    result_content = handle_run_task(tool_args.get("task_id", ""), body.org_id)
+
+                elif tool_name == "list_tasks":
+                    result_content = handle_list_tasks(agent_id)
+
+                elif tool_name == "execute_code":
+                    # Uses the shared ws.dir — all calls in this turn see each other's files
+                    from agent_runner import handle_sandbox_tool_call
+
+                    # Build file payload from current workspace state
+                    workspace_files: dict[str, bytes] = {}
+                    if ws.dir.exists():
+                        for f in ws.dir.rglob("*"):
+                            if f.is_file():
+                                rel = str(f.relative_to(ws.dir)).replace("\\", "/")
+                                workspace_files[rel] = f.read_bytes()
+
+                    import base64
+                    from sandbox_client import run_in_sandbox
+                    from workspace_manager import snapshot_hashes as snap
+
+                    flat_secrets: dict[str, str] = {}
+                    for d in all_secrets.values():
+                        flat_secrets.update(d)
+                    flat_secrets.update(agent_secrets)
+
+                    sandbox_result = await run_in_sandbox(
+                        code=tool_args.get("code", ""),
+                        entry_point=tool_args.get("entry_point", "main.py"),
+                        files={n: c for n, c in workspace_files.items()},
+                        env_vars=flat_secrets,
+                        packages=environment.get("packages", []),
+                        agent_id=agent_id,
+                        timeout=60,
+                    )
+
+                    # Write output files into shared workspace_dir immediately
+                    # so the next execute_code call in this turn sees them
+                    for filename, b64 in sandbox_result.get("output_files", {}).items():
+                        dest = ws.dir / filename
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(base64.b64decode(b64))
+
+                    if sandbox_result.get("exit_code", -1) != 0:
+                        result_content = (
+                            f"Code execution failed (exit {sandbox_result['exit_code']}).\n"
+                            f"stderr: {sandbox_result.get('stderr', '')}\n"
+                            f"stdout: {sandbox_result.get('stdout', '')}"
+                        )
+                    else:
+                        result_content = (
+                            sandbox_result.get("stdout", "")
+                            or "Code executed successfully with no stdout output."
+                        )
+
+                elif tool_name == "web_search":
+                    result_content = await run_web_search(
+                        tool_args.get("query", ""), tool_args.get("count", 5)
+                    )
+
+                elif tool_name == "browse_web":
+                    flat_secrets: dict[str, str] = {}
+                    for d in all_secrets.values():
+                        flat_secrets.update(d)
+                    flat_secrets.update(agent_secrets)
+                    result = await run_in_browser(
+                        task=tool_args.get("task", ""),
+                        start_url=tool_args.get("start_url"),
+                        env_vars=flat_secrets,
+                        timeout=tool_args.get("timeout", 120),
+                    )
+                    if result["ok"]:
+                        steps_summary = ", ".join(result.get("steps", [])[:5])
+                        result_content = f"Browser task completed.\nSteps: {steps_summary}\n\nResult:\n{result['result']}"
+                    else:
+                        result_content = f"Browser task failed: {result.get('error', 'Unknown error')}"
+
+                else:
+                    tool = tool_map.get(tool_name)
+                    if not tool:
+                        result_content = f"Tool '{tool_name}' not found."
+                    else:
+                        secrets   = all_secrets.get(tool["toolset_id"], {})
+                        full_code = build_full_code(tool["name"], tool["parameters"], tool["code"])
+                        res       = await run_tool(full_code, tool["name"], tool_args, secrets)
+                        result_content = json.dumps(res["result"]) if res["ok"] else f"Error: {res['error']}"
+
+                save_message(
+                    agent_id, body.org_id, "tool", result_content,
+                    tool_name=tool_name, task_id=resolved_task_id,
+                    meta={"tool_call_id": call["id"]},
+                )
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": result_content})
 
     return {"response": final_response, "iterations": iteration}
 
