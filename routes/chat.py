@@ -481,8 +481,21 @@ async def chat(agent_id: str, body: ChatRequest):
 
             if llm_result["type"] == "text":
                 final_response = llm_result["content"]
-                save_message(agent_id, body.org_id, "assistant", final_response, task_id=resolved_task_id)
+                save_message(...)
                 break
+
+            # Model hallucinated a tool name Groq doesn't recognise — inject a
+            # corrective user message and let the model retry with the right name.
+            if llm_result["type"] == "hallucinated_tool":
+                bad   = llm_result["bad_tool"]
+                valid = ", ".join(llm_result["valid_tools"])
+                correction = (
+                    f"You called a tool named '{bad}' which does not exist. "
+                    f"The available tools are: {valid}. "
+                    f"Please retry using one of those exact tool names."
+                )
+                messages.append({"role": "user", "content": correction})
+                continue
 
             calls = llm_result["calls"]
 

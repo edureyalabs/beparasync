@@ -342,15 +342,25 @@ async def run_agent_task(run_id: str, task_id: str, agent_id: str):
             llm_result = await llm.run(system_prompt, messages, tool_defs)
 
             if llm_result["type"] == "text":
-                steps = append_step(run_id, steps, {
-                    "type": "llm_response", "iteration": iteration,
-                    "content": llm_result["content"], "timestamp": now_iso(),
-                })
-                set_run_status(run_id, "completed", {
-                    "output": llm_result["content"],
-                    "completed_at": now_iso(), "steps": steps,
-                })
+                steps = append_step(...)
+                set_run_status(run_id, "completed", {...})
                 break
+
+            if llm_result["type"] == "hallucinated_tool":
+                bad   = llm_result["bad_tool"]
+                valid = ", ".join(llm_result["valid_tools"])
+                correction = (
+                    f"You called a tool named '{bad}' which does not exist. "
+                    f"The available tools are: {valid}. "
+                    f"Please retry using one of those exact tool names."
+                )
+                steps = append_step(run_id, steps, {
+                    "type":      "hallucinated_tool",
+                    "bad_tool":  bad,
+                    "timestamp": now_iso(),
+                })
+                messages.append({"role": "user", "content": correction})
+                continue
 
             calls = llm_result["calls"]
             messages.append({
