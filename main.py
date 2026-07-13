@@ -12,6 +12,8 @@ from routes.environments import router as environments_router
 from routes.agent_config import router as agent_config_router
 from routes.chat         import router as chat_router
 from routes.app          import router as app_router
+from routes.debug import router as debug_router
+
 
 load_dotenv()
 
@@ -47,6 +49,7 @@ app.include_router(environments_router)
 app.include_router(agent_config_router)
 app.include_router(chat_router)
 app.include_router(app_router)
+app.include_router(debug_router)
 
 
 @app.get("/health")
