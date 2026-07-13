@@ -12,18 +12,16 @@ from workspace_manager import _storage_prefix, BUCKET
 
 router = APIRouter(prefix="/app", tags=["app"])
 
-BACKEND = os.getenv("BACKEND_URL", "")  # e.g. https://beparasync.up.railway.app
+BACKEND = os.getenv("BACKEND_URL", "")
 
 
 def _verify(authorization: str | None) -> str:
-    """Validate Supabase JWT and return user_id."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     token = authorization.removeprefix("Bearer ").strip()
     if not token:
         raise HTTPException(status_code=401, detail="Empty token")
     try:
-        # Validate token against Supabase — this calls the Supabase auth API
         user_res = supabase.auth.get_user(token)
         if not user_res or not user_res.user:
             raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -46,7 +44,6 @@ def _resolve_task(agent_id: str, task_id: str) -> dict:
 
 
 def _check_org_access(user_id: str, org_id: str):
-    """Ensure the authenticated user belongs to this org."""
     res = (
         supabase.from_("organizations")
         .select("id")
@@ -59,10 +56,14 @@ def _check_org_access(user_id: str, org_id: str):
         raise HTTPException(status_code=403, detail="Access denied")
 
 
-# ── GET /app/{agent_id}/{task_id}/{app_name} → serve HTML ────────────────────
-@router.get("/{agent_id}/{task_id}/{app_name}", response_class=HTMLResponse)
-async def serve_app(
-    agent_id: str, task_id: str, app_name: str,
+# ── IMPORTANT: specific routes MUST come before the {app_name} wildcard ──────
+# FastAPI matches top-to-bottom; /_apps and /data /files /run would otherwise
+# be swallowed by the /{app_name} catch-all and return 404.
+
+# ── GET /app/{agent_id}/{task_id}/_apps ── list all apps ─────────────────────
+@router.get("/{agent_id}/{task_id}/_apps")
+async def list_apps(
+    agent_id: str, task_id: str,
     authorization: str | None = Header(default=None),
 ):
     user_id = _verify(authorization)
@@ -70,63 +71,15 @@ async def serve_app(
     org_id  = task["org_id"]
     _check_org_access(user_id, org_id)
 
-    key = f"{_app_prefix(org_id, agent_id, task_id, app_name)}/index.html"
+    prefix = f"{_storage_prefix(org_id, agent_id, task_id)}/apps"
     try:
-        content = supabase.storage.from_(BUCKET).download(key)
-        html    = content.decode("utf-8", errors="replace")
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"App '{app_name}' not found: {e}")
-
-    # Use absolute backend URL so iframe fetch calls work cross-origin
-    api_origin = BACKEND or ""
-
-    sdk = f"""<script>
-window.__APP__ = {{
-  agentId: "{agent_id}", taskId: "{task_id}", appName: "{app_name}",
-  _token: "",
-  _h() {{
-    return {{
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + (this._token || localStorage.getItem("sb-access-token") || "")
-    }};
-  }},
-  async data(key) {{
-    const r = await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/data/" + key, {{ headers: this._h() }});
-    if (!r.ok) return null;
-    return r.json();
-  }},
-  async setData(key, value) {{
-    await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/data/" + key, {{
-      method: "POST", headers: this._h(), body: JSON.stringify(value)
-    }});
-  }},
-  async run(script, params={{}}) {{
-    const r = await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/run/" + script, {{
-      method: "POST", headers: this._h(), body: JSON.stringify({{ params }})
-    }});
-    return r.json();
-  }},
-  async listData() {{
-    const r = await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/files", {{ headers: this._h() }});
-    return r.ok ? r.json() : [];
-  }}
-}};
-// Allow parent window to inject the auth token
-window.addEventListener("message", (e) => {{
-  if (e.data && e.data.type === "PARASYNC_TOKEN") {{
-    window.__APP__._token = e.data.token;
-  }}
-}});
-</script>"""
-
-    html = html.replace("</head>", sdk + "\n</head>") if "</head>" in html else sdk + html
-    return HTMLResponse(content=html, headers={
-        "X-Frame-Options": "SAMEORIGIN",
-        "Content-Security-Policy": "frame-ancestors 'self'",
-    })
+        items = supabase.storage.from_(BUCKET).list(prefix)
+        return {"apps": [i["name"] for i in (items or []) if i.get("name")]}
+    except Exception:
+        return {"apps": []}
 
 
-# ── GET /app/{agent_id}/{task_id}/{app_name}/data/{key} → read ───────────────
+# ── GET /app/{agent_id}/{task_id}/{app_name}/data/{key} ── read data ──────────
 @router.get("/{agent_id}/{task_id}/{app_name}/data/{key}")
 async def read_data(
     agent_id: str, task_id: str, app_name: str, key: str,
@@ -148,7 +101,7 @@ async def read_data(
         raise HTTPException(status_code=404, detail=f"'{key}' not found")
 
 
-# ── POST /app/{agent_id}/{task_id}/{app_name}/data/{key} → write ─────────────
+# ── POST /app/{agent_id}/{task_id}/{app_name}/data/{key} ── write data ────────
 @router.post("/{agent_id}/{task_id}/{app_name}/data/{key}")
 async def write_data(
     agent_id: str, task_id: str, app_name: str, key: str,
@@ -170,7 +123,7 @@ async def write_data(
     return {"ok": True}
 
 
-# ── POST /app/{agent_id}/{task_id}/{app_name}/run/{script} → execute ──────────
+# ── POST /app/{agent_id}/{task_id}/{app_name}/run/{script} ── execute ─────────
 class RunPayload(BaseModel):
     params: dict[str, Any] = {}
 
@@ -193,7 +146,6 @@ async def run_script(
     except Exception:
         raise HTTPException(status_code=404, detail=f"Script '{script}' not found")
 
-    # Download all JSON data files into sandbox workspace
     files: dict[str, bytes] = {}
     try:
         listed = supabase.storage.from_(BUCKET).list(app_prefix)
@@ -253,7 +205,7 @@ async def run_script(
     }
 
 
-# ── GET /app/{agent_id}/{task_id}/{app_name}/files → list data files ──────────
+# ── GET /app/{agent_id}/{task_id}/{app_name}/files ── list data files ─────────
 @router.get("/{agent_id}/{task_id}/{app_name}/files")
 async def list_files(
     agent_id: str, task_id: str, app_name: str,
@@ -272,10 +224,11 @@ async def list_files(
         return []
 
 
-# ── GET /app/{agent_id}/{task_id}/apps → list all apps ───────────────────────
-@router.get("/{agent_id}/{task_id}/_apps")
-async def list_apps(
-    agent_id: str, task_id: str,
+# ── GET /app/{agent_id}/{task_id}/{app_name} ── serve HTML ───────────────────
+# MUST be last — this wildcard catches everything not matched above.
+@router.get("/{agent_id}/{task_id}/{app_name}", response_class=HTMLResponse)
+async def serve_app(
+    agent_id: str, task_id: str, app_name: str,
     authorization: str | None = Header(default=None),
 ):
     user_id = _verify(authorization)
@@ -283,9 +236,55 @@ async def list_apps(
     org_id  = task["org_id"]
     _check_org_access(user_id, org_id)
 
-    prefix = f"{_storage_prefix(org_id, agent_id, task_id)}/apps"
+    key = f"{_app_prefix(org_id, agent_id, task_id, app_name)}/index.html"
     try:
-        items = supabase.storage.from_(BUCKET).list(prefix)
-        return {"apps": [i["name"] for i in (items or []) if i.get("name")]}
-    except Exception:
-        return {"apps": []}
+        content = supabase.storage.from_(BUCKET).download(key)
+        html    = content.decode("utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"App '{app_name}' not found: {e}")
+
+    api_origin = BACKEND or ""
+
+    sdk = f"""<script>
+window.__APP__ = {{
+  agentId: "{agent_id}", taskId: "{task_id}", appName: "{app_name}",
+  _token: "",
+  _h() {{
+    return {{
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + (this._token || localStorage.getItem("sb-access-token") || "")
+    }};
+  }},
+  async data(key) {{
+    const r = await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/data/" + key, {{ headers: this._h() }});
+    if (!r.ok) return null;
+    return r.json();
+  }},
+  async setData(key, value) {{
+    await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/data/" + key, {{
+      method: "POST", headers: this._h(), body: JSON.stringify(value)
+    }});
+  }},
+  async run(script, params={{}}) {{
+    const r = await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/run/" + script, {{
+      method: "POST", headers: this._h(), body: JSON.stringify({{ params }})
+    }});
+    return r.json();
+  }},
+  async listData() {{
+    const r = await fetch("{api_origin}/app/{agent_id}/{task_id}/{app_name}/files", {{ headers: this._h() }});
+    return r.ok ? r.json() : [];
+  }}
+}};
+window.addEventListener("message", (e) => {{
+  if (e.data && e.data.type === "PARASYNC_TOKEN") {{
+    window.__APP__._token = e.data.token;
+  }}
+}});
+</script>"""
+
+    html = html.replace("</head>", sdk + "\n</head>") if "</head>" in html else sdk + html
+    return HTMLResponse(content=html, headers={
+        "X-Frame-Options": "SAMEORIGIN",
+        "Content-Security-Policy": "frame-ancestors 'self'",
+    })
